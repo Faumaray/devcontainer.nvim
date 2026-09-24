@@ -876,9 +876,15 @@ test("git: SSH agent relay forwards to $SSH_AUTH_SOCK", function()
   vim.env.SSH_AUTH_SOCK = orig
 end)
 
-test("lsp.start_clients: a newer move takes over the clients of the pending one", function()
-  local stopped = false
-  local client = { id = 4242, is_stopped = function() return stopped end, stop = function() end }
+test("lsp.start_clients: waits for the clients to exit; a newer move takes over the pending one", function()
+  -- like Neovim's: is_stopped() right after stop(), while the server is still exiting (and attached)
+  local alive = true
+  local client = { id = 4242, is_stopped = function() return true end, stop = function() end }
+  local orig_get = vim.lsp.get_client_by_id
+  vim.lsp.get_client_by_id = function(id)
+    if id == client.id then return alive and client or nil end
+    return orig_get(id)
+  end
   local buf = scratch_named("/moves/w/a.c")
   local calls = {}
   local orig = vim.lsp.start
@@ -887,10 +893,13 @@ test("lsp.start_clients: a newer move takes over the clients of the pending one"
   local after = 0
   lsp.start_clients({ entry }, function() after = after + 1 end, "/moves/w") -- e.g. up
   lsp.start_clients({}, nil, "/moves/w") -- e.g. stop right after: takes the client over
-  stopped = true
+  vim.wait(400)
+  local early = #calls
+  alive = false
   vim.wait(1000, function() return #calls > 0 end)
   vim.wait(300)
-  vim.lsp.start = orig
+  vim.lsp.start, vim.lsp.get_client_by_id = orig, orig_get
+  eq(early, 0, "not started while the old client is still running")
   eq(calls, { { "srv", buf } }, "started once")
   eq(after, 1, "the superseded move's callback runs once, after the merged move")
 end)

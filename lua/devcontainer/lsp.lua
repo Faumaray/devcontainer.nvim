@@ -373,8 +373,8 @@ end
 -- folder -> the move in progress: its clients are still exiting
 local moves = {}
 
---- Wait (≤3s) for the stopped clients to exit, then start them again for their buffers.
---- Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
+--- Wait for the stopped clients to exit (killed after 3s), then start them again for their
+--- buffers. Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
 ---
 --- One move per workspace: a newer one (stop right after up, up with another backend, ...) takes
 --- over the clients of the one still waiting, instead of both starting them when their timers fire.
@@ -411,14 +411,21 @@ function M.start_clients(entries, after, folder)
     if folder and moves[folder] == move then moves[folder] = nil end
   end
   if folder then moves[folder] = move end
-  local waited = 0
+  local waited, killed = 0, false
   timer:start(0, 100, vim.schedule_wrap(function()
     if timer:is_closing() then return end
     waited = waited + 100
-    local pending = vim.tbl_filter(function(e) return not e.client:is_stopped() end, entries)
+    -- is_stopped() is true as soon as stop() was called; until the client is gone it is still
+    -- attached, and requests to its buffers would wait for the exiting server too
+    local pending = vim.tbl_filter(function(e) return vim.lsp.get_client_by_id(e.client.id) ~= nil end, entries)
     if #pending > 0 and waited < 3000 then return end
+    if #pending > 0 and not killed then
+      killed = true
+      -- stop(true) is a no-op on 0.11 for a client that is already stopping
+      for _, e in ipairs(pending) do pcall(function() e.client.rpc.terminate() end) end
+    end
+    if #pending > 0 and waited < 5000 then return end
     move.cancel()
-    for _, e in ipairs(pending) do e.client:stop(true) end
 
     for _, e in ipairs(entries) do
       local host_cmd = host_cmd_of(e.config)

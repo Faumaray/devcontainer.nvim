@@ -85,6 +85,14 @@ vim.fn.mkdir(E .. "/dotrepo", "p")
 write(E .. "/dotrepo/.e2erc", "x\n")
 vim.system({ "sh", "-c", 'cd "$1" && git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x', "sh", E .. "/dotrepo" }):wait()
 
+-- a clangd that takes a moment to exit, like one busy indexing: the old client of a move is still
+-- running (and attached) for a while after stop()
+local real_clangd = vim.fn.exepath("clangd")
+vim.fn.mkdir(E .. "/slow-exit", "p")
+write(E .. "/slow-exit/clangd", ('#!/bin/sh\n"%s" "$@"\nsleep 0.5\n'):format(real_clangd))
+vim.uv.fs_chmod(E .. "/slow-exit/clangd", 493)
+vim.env.PATH = E .. "/slow-exit:" .. vim.env.PATH
+
 require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker",
   git = { gitconfig = E .. "/host.gitconfig" }, dotfiles = { repository = E .. "/dotrepo" } })
 vim.lsp.config("clangd", {
@@ -97,6 +105,12 @@ vim.lsp.enable("clangd")
 -- 1. before `up`: clangd runs on the host -----------------------------------------------------
 vim.cmd.edit(HOST .. "/main.cpp")
 local main_buf = vim.api.nvim_get_current_buf()
+-- a moved client starts once the old one is gone: two attached clients would both get requests
+local overlaps = {}
+vim.api.nvim_create_autocmd("LspAttach", { buffer = main_buf, callback = function()
+  local ids = vim.tbl_map(function(c) return c.id end, vim.lsp.get_clients({ bufnr = main_buf, name = "clangd" }))
+  if #ids > 1 then overlaps[#overlaps + 1] = ids end
+end })
 check("host clangd attached", wait(10000, function() return #vim.lsp.get_clients({ bufnr = main_buf }) == 1 end))
 check("host client is not in a container", vim.lsp.get_clients({ bufnr = main_buf })[1].config._devcontainer_key == nil)
 
@@ -477,6 +491,8 @@ require("devcontainer").down({ confirm = false })
 check("down: detached and container removed", require("devcontainer").get(HOST) == nil and wait(5000, function()
   return (read(E .. "/docker.log") or ""):find('"rm", "-f", "cc0123456789', 1, true) ~= nil
 end))
+
+check("never two clangd clients attached to a buffer at once", #overlaps == 0, overlaps)
 
 io.stdout:write(failures == 0 and "\nall e2e checks passed\n" or ("\n%d e2e checks failed\n"):format(failures))
 for _, c in ipairs(vim.lsp.get_clients()) do c:stop(true) end
