@@ -113,6 +113,8 @@ check("only one clangd attached", #vim.lsp.get_clients({ bufnr = main_buf }) == 
 local docker_log = read(E .. "/docker.log") or ""
 check("server spawned through docker exec -i", docker_log:find('"exec", "-i", "-u", "vscode"', 1, true)
   and docker_log:find("clangd", 1, true) ~= nil)
+check("server binary looked up by the prefetch, not one exec per server",
+  docker_log:find("for b; do", 1, true) ~= nil and docker_log:find('"sh", "clangd"]', 1, true) == nil)
 
 -- 3. diagnostics come back with host URIs ----------------------------------------------------
 check("diagnostics on host buffer", wait(15000, function()
@@ -164,6 +166,19 @@ vim.api.nvim_buf_set_lines(0, 0, -1, false, { "new", "content" })
 vim.cmd("silent write")
 check("remote file written", read(E .. "/container-only/note.txt") == "new\ncontent\n", read(E .. "/container-only/note.txt"))
 check("buffer not modified after write", not vim.bo.modified)
+
+vim.cmd.edit(prefix .. E .. "/container-only/")
+local listing = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+check("remote directory listed", vim.tbl_contains(listing, "note.txt") and vim.bo.filetype == "devcontainer_dir", listing)
+for i, l in ipairs(listing) do
+  if l == "note.txt" then vim.api.nvim_win_set_cursor(0, { i, 0 }) end
+end
+vim.cmd.normal(vim.keycode("<CR>"))
+check("<CR> in a listing opens the file", vim.api.nvim_buf_get_name(0) == prefix .. E .. "/container-only/note.txt", vim.api.nvim_buf_get_name(0))
+vim.cmd.edit(prefix .. E .. "/container-only/brand-new.txt")
+vim.api.nvim_buf_set_lines(0, 0, -1, false, { "fresh" })
+vim.cmd("silent write")
+check("new remote file created", read(E .. "/container-only/brand-new.txt") == "fresh\n", read(E .. "/container-only/brand-new.txt"))
 
 -- 7. DAP proxy -------------------------------------------------------------------------------
 local adapter = require("devcontainer").dap_adapter({ command = "python3", args = { root .. "/tests/fake-dap.py" } })

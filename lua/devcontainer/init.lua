@@ -12,6 +12,7 @@ local busy = {}
 ---@param opts? devcontainer.Options
 function M.setup(opts)
   config.set(opts)
+  spec.clear_cache()
   did_setup = true
   require("devcontainer.lsp").patch()
   if config.options.remote_fs then require("devcontainer.remote_fs").setup() end
@@ -74,7 +75,7 @@ local function is_running(session)
 end
 
 --- Start (or reuse) the devcontainer of the current workspace and move its LSP clients into it.
----@param opts? { rebuild?: boolean, path?: string, quiet?: boolean }
+---@param opts? { rebuild?: boolean, no_cache?: boolean, path?: string, quiet?: boolean }
 function M.up(opts)
   ensure_setup()
   opts = opts or {}
@@ -90,6 +91,7 @@ function M.up(opts)
 
   async.run(function()
     local configs = spec.list_configs(root)
+    if #configs == 0 then error("no devcontainer.json in " .. root, 0) end
     local config_file = configs[1]
     if #configs > 1 then
       config_file = async.select(configs, {
@@ -123,7 +125,7 @@ function M.up(opts)
       remote_folder = remote_folder,
       explicit_remote_folder = explicit,
       docker = config.options.docker,
-    }, { rebuild = opts.rebuild })
+    }, { rebuild = opts.rebuild, no_cache = opts.no_cache })
 
     local session = registry.new({
       container_id = res.container_id,
@@ -137,6 +139,14 @@ function M.up(opts)
       name = res.config.name or name,
     })
     session:setup_env(res.config)
+    -- one exec instead of one blocking `which` per server when the clients move in
+    local bins = lsp.binaries(root)
+    for _, e in ipairs(entries) do
+      local cmd = lsp.host_cmd(e.config)
+      if type(cmd) == "table" and type(cmd[1]) == "string" then vim.list_extend(bins, { cmd[1], vim.fs.basename(cmd[1]) }) end
+    end
+    table.insert(bins, config.options.project.debug.command[1])
+    session:prefetch(bins)
 
     -- lifecycle hooks (the devcontainer CLI runs these itself)
     for _, hook in ipairs(res.hooks or {}) do
@@ -161,14 +171,19 @@ function M.up(opts)
   end)
 end
 
-function M.rebuild()
-  M.up({ rebuild = true })
+function M.rebuild(opts)
+  M.up(vim.tbl_extend("force", opts or {}, { rebuild = true }))
 end
 
 --- Detach from and stop the current workspace's container; LSP clients move back to the host.
 function M.stop()
-  local s = registry.current()
-  if not s then return log.warn("no devcontainer attached to this workspace") end
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    M._stop(s)
+  end, "Stop devcontainer")
+end
+
+function M._stop(s)
   local lsp = require("devcontainer.lsp")
   local entries = lsp.stop_clients(s.local_folder, s.key)
   M._teardown(s)
@@ -187,14 +202,15 @@ local LOGIN_SHELL = 'shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f
 
 --- Open a terminal running `cmd` (or the user's login shell) in the container.
 function M.exec(cmd)
-  local s = registry.current()
-  if not s then return log.warn("no devcontainer attached — run :Devcontainer up") end
-  local argv = (cmd and vim.trim(cmd) ~= "") and { "/bin/sh", "-lc", cmd } or { "/bin/sh", "-c", LOGIN_SHELL }
   local dir = vim.fn.expand("%:p:h")
-  local cwd = (dir ~= "" and s:remote_path(dir)) or s.remote_folder
-  vim.cmd("botright new")
-  vim.fn.jobstart(s:exec_argv(argv, { tty = true, cwd = cwd }), { term = true, cwd = s.local_folder })
-  vim.cmd("startinsert")
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached — run :Devcontainer up") end
+    local argv = (cmd and vim.trim(cmd) ~= "") and { "/bin/sh", "-lc", cmd } or { "/bin/sh", "-c", LOGIN_SHELL }
+    local cwd = (dir ~= "" and s:remote_path(dir)) or s.remote_folder
+    vim.cmd("botright new")
+    vim.fn.jobstart(s:exec_argv(argv, { tty = true, cwd = cwd }), { term = true, cwd = s.local_folder })
+    vim.cmd("startinsert")
+  end, "Devcontainer")
 end
 
 function M.info()
@@ -223,8 +239,10 @@ end
 function M.statusline()
   local s = registry.current()
   if s then return s.name end
+  if next(busy) == nil then return "" end
   local path = vim.api.nvim_buf_get_name(0)
-  local root = spec.find_root(path ~= "" and path or vim.fn.getcwd())
+  if path == "" or path:match("^%a[%w+.-]*://") then path = vim.fn.getcwd() end
+  local root = spec.find_root_cached(path)
   if root and busy[root] then return vim.fs.basename(root) .. " (starting)" end
   return ""
 end
@@ -261,8 +279,11 @@ function M.select()
 end
 
 --- Session attached to `path` (defaults to the current buffer / cwd).
+---@param path? string
+---@return devcontainer.Session?
 function M.get(path)
-  return path and registry.find(path) or registry.current()
+  if path then return registry.find(path) end
+  return registry.current()
 end
 
 function M.dap_adapter(adapter_spec)

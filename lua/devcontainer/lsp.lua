@@ -34,20 +34,15 @@ local function host_cmd_of(cfg)
   if type(cfg.cmd) == "table" then return cfg.cmd end
   if type(cfg.cmd) == "function" then return helpers[cfg.cmd] end
 end
+M.host_cmd = host_cmd_of
 
---- Rewrite host paths inside command-line arguments (--compile-commands-dir=/home/me/proj/build).
-local function map_arg(session, arg)
-  if type(arg) ~= "string" then return arg end
-  for _, root in ipairs(session.local_roots) do
-    local i = arg:find(root, 1, true)
-    if i then
-      local after = arg:sub(i + #root, i + #root)
-      if after == "" or after == "/" then
-        return arg:sub(1, i - 1) .. session.remote_folder .. arg:sub(i + #root)
-      end
-    end
-  end
-  return arg
+-- private Neovim helpers, with fallbacks in case they move
+local resolve_bufnr = vim._resolve_bufnr or function(bufnr)
+  return (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+end
+local get_workspace_folders = vim.lsp._get_workspace_folders or function(folders)
+  if type(folders) == "table" then return folders end
+  if type(folders) == "string" then return { { uri = vim.uri_from_fname(folders), name = folders } } end
 end
 
 --- argv to run inside the container, or nil when the server isn't installed there.
@@ -64,7 +59,7 @@ local function remote_argv(session, name, host_cmd)
   end
   if not found then return nil end
   local argv = { found }
-  for i = 2, #host_cmd do argv[#argv + 1] = map_arg(session, host_cmd[i]) end
+  for i = 2, #host_cmd do argv[#argv + 1] = session:map_arg(host_cmd[i]) end
   return argv
 end
 
@@ -172,9 +167,9 @@ end
 -- Same as Neovim's default reuse_client (not exported).
 local function default_reuse(client, cfg)
   if client.name ~= cfg.name or client:is_stopped() then return false end
-  local folders = vim.lsp._get_workspace_folders(cfg.workspace_folders or cfg.root_dir)
+  local folders = get_workspace_folders(cfg.workspace_folders or cfg.root_dir)
   if not folders or not next(folders) then
-    local cf = vim.lsp._get_workspace_folders(client.config.workspace_folders or client.config.root_dir)
+    local cf = get_workspace_folders(client.config.workspace_folders or client.config.root_dir)
     return not cf or not next(cf)
   end
   for _, f in ipairs(folders) do
@@ -208,7 +203,7 @@ function M.patch()
   vim.lsp.start = function(cfg, start_opts)
     start_opts = start_opts or {}
     if type(cfg) ~= "table" or not opts().enabled then return orig_start(cfg, start_opts) end
-    local bufnr = vim._resolve_bufnr(start_opts.bufnr)
+    local bufnr = resolve_bufnr(start_opts.bufnr)
 
     -- container-only files (devcontainer://<id>/usr/include/...) only talk to that container's servers
     local key = vim.api.nvim_buf_get_name(bufnr):match("^devcontainer://([^/]+)")
@@ -253,6 +248,19 @@ end
 
 local function inside(path, folder)
   return path == folder or path:sub(1, #folder + 1) == folder .. "/"
+end
+
+--- Executables of the running clients whose workspace is `folder` (or below): what `up` has to
+--- look up in the container before moving them (see Session:prefetch).
+function M.binaries(folder)
+  local out = {}
+  for _, c in ipairs(vim.lsp.get_clients()) do
+    local root, cmd = M.root_of(c.config), host_cmd_of(c.config)
+    if root and inside(root, folder) and type(cmd) == "table" and type(cmd[1]) == "string" then
+      vim.list_extend(out, { cmd[1], vim.fs.basename(cmd[1]) })
+    end
+  end
+  return out
 end
 
 ---@class devcontainer.LspEntry

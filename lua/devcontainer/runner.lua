@@ -35,20 +35,7 @@ end
 --- Replace container workspace paths in a line of output with host paths.
 function M.map_line(session, line)
   if not session then return line end
-  local remote, host = session.remote_folder, session.local_folder
-  if remote == host or not line:find(remote, 1, true) then return line end
-  local out, i = {}, 1
-  while true do
-    local s, e = line:find(remote, i, true)
-    if not s then break end
-    local prev, nxt = line:sub(s - 1, s - 1), line:sub(e + 1, e + 1)
-    local boundary_before = prev == "" or not prev:match("[%w_.%-/]")
-    local boundary_after = nxt == "" or nxt:match("[/:%s'\"%)%],;]") ~= nil
-    out[#out + 1] = line:sub(i, s - 1) .. ((boundary_before and boundary_after) and host or remote)
-    i = e + 1
-  end
-  out[#out + 1] = line:sub(i)
-  return table.concat(out)
+  return require("devcontainer.paths").replace_root(line, session.remote_folder, session.local_folder)
 end
 
 --- Host name for a file reported by a task that ran in `session`, or nil to keep it.

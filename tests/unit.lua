@@ -412,5 +412,59 @@ test("autostart: ask once, remember always/never", function()
   dcm.up, vim.ui.select = orig_up, orig_select
 end)
 
+-- fixes ----------------------------------------------------------------------------------------
+
+test("spec.find_root needs a config, not just a .devcontainer folder", function()
+  local base = tmp .. "/roots"
+  writef(base .. "/outer/.devcontainer/devcontainer.json", "{}")
+  writef(base .. "/outer/inner/.devcontainer/Dockerfile", "FROM x")
+  vim.fn.mkdir(base .. "/outer/inner/src", "p")
+  eq(spec.find_root(base .. "/outer/inner/src"), base .. "/outer")
+  writef(base .. "/outer/inner/.devcontainer/cpp/devcontainer.json", "{}")
+  eq(spec.find_root(base .. "/outer/inner/src"), base .. "/outer/inner")
+  eq(spec.find_root_cached(base .. "/outer/inner/src"), base .. "/outer/inner")
+end)
+
+test("paths.replace_root / session:map_arg replace whole paths only", function()
+  eq(paths.replace_root("a /ws/p:1 /ws/p/x '/ws/p' /ws/p2 /x/ws/p", "/ws/p", "/h"), "a /h:1 /h/x '/h' /ws/p2 /x/ws/p")
+  local s = fake_session({})
+  eq(s:map_arg("--compile-commands-dir=/home/me/proj/build"), "--compile-commands-dir=/workspaces/proj/build")
+  eq(s:map_arg("cd /home/me/proj && make -C /home/me/proj/sub"), "cd /workspaces/proj && make -C /workspaces/proj/sub")
+  eq(s:map_arg("/home/me/project2/x"), "/home/me/project2/x")
+  eq(s:map_arg(42), 42)
+end)
+
+test("get(path) does not fall back to the current session", function()
+  local s = fake_session({})
+  session_mod.register(s)
+  local dcm = require("devcontainer")
+  eq(dcm.get("/home/me/proj/a.c"), s)
+  eq(dcm.get("/somewhere/else"), nil)
+  session_mod.unregister(s)
+end)
+
+test("registry.pick: current, only one, or ask", function()
+  local a, b = fake_session({}), session_mod.new({ container_id = "fedcba9876543210", local_folder = "/other", remote_folder = "/w/o", docker = "docker" })
+  local got, asked = "unset", 0
+  local orig = vim.ui.select
+  vim.ui.select = function(items, _, cb) asked = asked + 1; cb(items[2]) end
+  session_mod.pick(function(s) got = s end)
+  eq(got, nil)
+  session_mod.register(a)
+  session_mod.pick(function(s) got = s end)
+  eq({ got, asked }, { a, 0 })
+  session_mod.register(b)
+  session_mod.pick(function(s) got = s end)
+  eq(asked, 1)
+  session_mod.unregister(a)
+  session_mod.unregister(b)
+  vim.ui.select = orig
+end)
+
+test("cargo: custom profiles from Cargo.toml", function()
+  writef(tmp .. "/prof/Cargo.toml", '[profile.ci]\ninherits = "release"\n[profile.ci.package.foo]\nopt-level = 1\n[profile.fast]\n')
+  eq(cargo.profiles(tmp .. "/prof"), { "dev", "release", "ci", "fast" })
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

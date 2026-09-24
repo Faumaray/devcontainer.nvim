@@ -8,10 +8,32 @@ function M.normalize_dir(p)
   return (p:gsub("(.)/+$", "%1"))
 end
 
---- Workspace root = folder containing .devcontainer/ or .devcontainer.json
+--- Workspace root = nearest folder with a devcontainer config (.devcontainer.json,
+--- .devcontainer/devcontainer.json or .devcontainer/<name>/devcontainer.json). A .devcontainer/
+--- folder without a config in it (just a Dockerfile, say) doesn't count.
 function M.find_root(path)
-  local root = vim.fs.root(path, { ".devcontainer.json", ".devcontainer" })
+  local root = vim.fs.root(path, function(name, dir)
+    if name == ".devcontainer.json" then return true end
+    return name == ".devcontainer" and #M.list_configs(dir) > 0
+  end)
   return root and M.normalize_dir(root)
+end
+
+local root_cache = {}
+local ROOT_CACHE_MS = 2000
+
+--- find_root with a short-lived cache, for callers that run on every redraw (statuslines).
+function M.find_root_cached(path)
+  local now = vim.uv.now()
+  local hit = root_cache[path]
+  if hit and now - hit.time < ROOT_CACHE_MS then return hit.root or nil end
+  local root = M.find_root(path)
+  root_cache[path] = { root = root or false, time = now }
+  return root
+end
+
+function M.clear_cache()
+  root_cache = {}
 end
 
 function M.list_configs(root)

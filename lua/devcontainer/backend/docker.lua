@@ -45,7 +45,7 @@ local function run_on_host(cmd, cwd)
   end
 end
 
-local function build_image(ctx, conf)
+local function build_image(ctx, conf, opts)
   local build = type(conf.build) == "table" and conf.build or {}
   local dockerfile = build.dockerfile or conf.dockerFile
   if not dockerfile then
@@ -57,6 +57,7 @@ local function build_image(ctx, conf)
   local slug = (vim.fs.basename(ctx.local_folder):lower():gsub("[^%w_.-]", "-"))
   local tag = ("nvim-devcontainer-%s-%s"):format(slug, vim.fn.sha256(ctx.config_file):sub(1, 8))
   local args = { ctx.docker, "build", "-f", rel(dockerfile), "-t", tag }
+  if opts.no_cache then table.insert(args, "--no-cache") end
   for k, v in vim.spairs(build.args or {}) do vim.list_extend(args, { "--build-arg", k .. "=" .. tostring(v) }) end
   if build.target then vim.list_extend(args, { "--target", build.target }) end
   vim.list_extend(args, build.options or {})
@@ -128,7 +129,7 @@ function M.up(ctx, opts)
   local remote_folder = ctx.remote_folder
   if not id then
     if conf.initializeCommand then run_on_host(conf.initializeCommand, ctx.local_folder) end
-    id = create(ctx, conf, build_image(ctx, conf), labels)
+    id = create(ctx, conf, build_image(ctx, conf, opts), labels)
     hooks = { "onCreateCommand", "updateContentCommand", "postCreateCommand", "postStartCommand" }
   else
     if state ~= "running" then

@@ -70,6 +70,16 @@ end
 function Session:remote_path(p) return self.dap:path_to_remote(p) end
 function Session:local_path(p) return self.dap:path_to_local(p) end
 
+--- Rewrite host workspace paths inside an argument (--compile-commands-dir=/home/me/proj/build,
+--- "cd /home/me/proj && make") to container paths.
+function Session:map_arg(arg)
+  if type(arg) ~= "string" then return arg end
+  for _, root in ipairs(self.local_roots) do
+    arg = paths.replace_root(arg, root, self.remote_folder)
+  end
+  return arg
+end
+
 --- Capture the environment a login/interactive shell of the remote user would have
 --- (VS Code's userEnvProbe). Runs inside async.run.
 function Session:probe_env(mode)
@@ -123,6 +133,27 @@ function Session:which(bin)
   return self._which[bin] or nil
 end
 
+--- Resolve several executables with a single `docker exec` so that later `which` calls are
+--- answered from the cache. Runs inside async.run.
+---@param bins string[]
+function Session:prefetch(bins)
+  local todo, seen = {}, {}
+  for _, b in ipairs(bins) do
+    if type(b) == "string" and b ~= "" and self._which[b] == nil and not seen[b] then
+      seen[b] = true
+      todo[#todo + 1] = b
+    end
+  end
+  if #todo == 0 then return end
+  local script = 'for b; do printf "%s\\t%s\\n" "$b" "$(command -v "$b" 2>/dev/null)"; done'
+  local res = async.system(self:exec_argv(vim.list_extend({ "/bin/sh", "-c", script, "sh" }, todo)), { text = true })
+  if res.code ~= 0 then return end
+  for line in vim.gsplit(res.stdout or "", "\n", { plain = true }) do
+    local bin, path = line:match("^([^\t]+)\t(.*)$")
+    if bin and seen[bin] then self._which[bin] = path ~= "" and path or false end
+  end
+end
+
 -- registry -------------------------------------------------------------------
 
 function M.register(s) M.by_key[s.key] = s end
@@ -154,6 +185,29 @@ end
 function M.current()
   local name = vim.api.nvim_buf_get_name(0)
   return M.find(name) or M.find(vim.fn.getcwd())
+end
+
+--- Attached sessions, sorted by name.
+---@return devcontainer.Session[]
+function M.list()
+  local all = vim.tbl_values(M.by_key)
+  table.sort(all, function(a, b) return a.name < b.name end)
+  return all
+end
+
+--- Call `cb` with the session of the current buffer / cwd; else the only attached one; else ask.
+--- `cb(nil)` when nothing is attached (or the choice was cancelled).
+---@param cb fun(session: devcontainer.Session?)
+---@param prompt? string
+function M.pick(cb, prompt)
+  local s = M.current()
+  if s then return cb(s) end
+  local all = M.list()
+  if #all <= 1 then return cb(all[1]) end
+  vim.ui.select(all, {
+    prompt = prompt or "Devcontainer",
+    format_item = function(x) return ("%s  (%s)"):format(x.name, vim.fn.fnamemodify(x.local_folder, ":~")) end,
+  }, cb)
 end
 
 return M

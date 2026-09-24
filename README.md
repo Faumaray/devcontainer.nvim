@@ -63,7 +63,7 @@ lazy.nvim:
 
 ```lua
 {
-  "you/devcontainer.nvim",
+  "faumaray/devcontainer.nvim",
   lazy = false, -- must be loaded before the first LSP client starts
   opts = {},
 }
