@@ -103,6 +103,34 @@ function M.load(config_file, local_folder)
   return M.substitute(raw, ctx), ctx.remote_folder, explicit
 end
 
+--- Files that define the container: devcontainer.json, its Dockerfile, its compose files.
+---@return string[]
+function M.config_files(config_file, conf)
+  local dir = vim.fs.dirname(config_file)
+  local function abs(p) return vim.fs.normalize(p:sub(1, 1) == "/" and p or (dir .. "/" .. p)) end
+  local files = { config_file }
+  local build = type(conf.build) == "table" and conf.build or {}
+  local dockerfile = build.dockerfile or conf.dockerFile
+  if type(dockerfile) == "string" then table.insert(files, abs(dockerfile)) end
+  local compose = conf.dockerComposeFile
+  for _, f in ipairs(type(compose) == "string" and { compose } or type(compose) == "table" and compose or {}) do
+    if type(f) == "string" then table.insert(files, abs(f)) end
+  end
+  return files
+end
+
+--- Hash of the files that define the container, to notice that it needs a rebuild.
+function M.fingerprint(config_file, conf)
+  local parts = {}
+  for _, f in ipairs(M.config_files(config_file, conf)) do
+    local fd = io.open(f, "rb")
+    local data = fd and fd:read("*a") or ""
+    if fd then fd:close() end
+    parts[#parts + 1] = f .. "\31" .. data:gsub("%z", "")
+  end
+  return vim.fn.sha256(table.concat(parts, "\30")):sub(1, 16)
+end
+
 --- Lifecycle command (string | string[] | { name = cmd }) -> list of argv
 function M.commands(cmd)
   if type(cmd) == "string" then return { { "/bin/sh", "-c", cmd } } end

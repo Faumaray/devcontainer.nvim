@@ -3,6 +3,7 @@ local config = require("devcontainer.config")
 local log = require("devcontainer.log")
 local registry = require("devcontainer.session")
 local spec = require("devcontainer.spec")
+local store = require("devcontainer.store")
 
 local M = {}
 
@@ -28,15 +29,51 @@ function M.setup(opts)
       require("devcontainer.profiles").invalidate()
     end,
   })
+  if config.options.watch_config then
+    vim.api.nvim_create_autocmd("BufWritePost", {
+      group = group,
+      callback = function(ev) M._config_saved(vim.fs.normalize(vim.fn.fnamemodify(ev.match, ":p"))) end,
+    })
+  end
   if config.options.stop_on_exit then
     vim.api.nvim_create_autocmd("VimLeavePre", {
       group = group,
       callback = function()
         for _, s in pairs(registry.by_key) do
-          vim.system({ s.docker, "stop", s.container_id }, { detach = true })
+          require("devcontainer.container").stop_detached(s)
         end
       end,
     })
+  end
+end
+
+--- User autocmd + statusline refresh.
+local function emit(pattern, data)
+  vim.api.nvim_exec_autocmds("User", { pattern = pattern, modeline = false, data = data })
+  pcall(vim.cmd.redrawstatus, { bang = true })
+end
+
+local function event_data(s)
+  return { name = s.name, key = s.key, container_id = s.container_id, local_folder = s.local_folder, remote_folder = s.remote_folder }
+end
+
+--- A file that defines an attached container was saved: offer to rebuild.
+local prompting = {}
+function M._config_saved(file)
+  for _, s in pairs(registry.by_key) do
+    local dir = vim.fs.dirname(s.config_file)
+    -- .devcontainer/ (not the workspace itself for a root .devcontainer.json)
+    local in_config_dir = dir ~= s.local_folder and vim.startswith(file, dir .. "/")
+    if (in_config_dir or vim.tbl_contains(s.watch_files or {}, file)) and not prompting[s.key] then
+      prompting[s.key] = true
+      vim.ui.select({ "Rebuild now", "Not now" }, {
+        prompt = ("The configuration of %s changed"):format(s.name),
+        kind = "devcontainer.rebuild",
+      }, function(choice)
+        prompting[s.key] = nil
+        if choice == "Rebuild now" then M.up({ path = s.local_folder, rebuild = true }) end
+      end)
+    end
   end
 end
 
@@ -93,6 +130,19 @@ function M._teardown(session)
       pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end
   end
+  emit("DevcontainerDetached", event_data(session))
+end
+
+--- devcontainer:// buffers read before the container was attached (restored by a session
+--- manager, say) are read again now.
+local function reload_unread(session)
+  local prefix = "devcontainer://" .. session.key .. "/"
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and vim.b[buf].devcontainer_unread
+      and vim.startswith(vim.api.nvim_buf_get_name(buf), prefix) and not vim.bo[buf].modified then
+      vim.api.nvim_buf_call(buf, function() pcall(vim.cmd.edit, { bang = true }) end)
+    end
+  end
 end
 
 local function is_running(session)
@@ -114,6 +164,7 @@ function M.up(opts)
   end
   if busy[root] then return log.warn("devcontainer for " .. root .. " is already starting") end
   busy[root] = true
+  emit("DevcontainerStarting", { local_folder = root })
 
   async.run(function()
     local o = config.get(root)
@@ -132,6 +183,19 @@ function M.up(opts)
       end
       entries = lsp.stop_clients(root, existing.key)
       M._teardown(existing)
+    end
+
+    -- the container predates changes to devcontainer.json / Dockerfile: offer to rebuild it
+    local fingerprint = spec.fingerprint(config_file, conf)
+    local known = store.get(root).fingerprint
+    if not opts.rebuild and o.watch_config and type(known) == "table" and known.file == config_file
+      and known.hash ~= fingerprint and #require("devcontainer.container").find(o.docker, root, config_file) > 0 then
+      local choice = async.select({ "Rebuild the container", "Start the existing container" }, {
+        prompt = "The devcontainer configuration changed since the container was built",
+        kind = "devcontainer.rebuild",
+      })
+      if not choice then return end
+      opts.rebuild = choice == "Rebuild the container"
     end
 
     local backend_name, backend = pick_backend(o)
@@ -179,9 +243,15 @@ function M.up(opts)
       end
     end
 
+    require("devcontainer.container").inspect(session)
+    session.watch_files = spec.config_files(config_file, conf)
+    store.set(root, "fingerprint", { file = config_file, hash = fingerprint })
+
     registry.register(session)
     log.info(("attached to %s: %s -> %s"):format(session.name, root, session.remote_folder))
     lsp.restart(root, entries)
+    reload_unread(session)
+    emit("DevcontainerAttached", event_data(session))
 
     -- postAttachCommand runs on every attach and is left to the tool, even with the CLI
     for _, argv in ipairs(spec.commands(res.config.postAttachCommand)) do
@@ -210,14 +280,56 @@ function M._stop(s)
   local entries = lsp.stop_clients(s.local_folder, s.key)
   M._teardown(s)
   log.info("stopping " .. s.name)
-  vim.system({ s.docker, "stop", s.container_id }, { text = true }, function(res)
-    if res.code ~= 0 then
-      log.error("docker stop failed: " .. vim.trim(res.stderr or ""))
-    else
-      log.info(s.name .. " stopped")
-    end
+  require("devcontainer.container").stop(s, function(err)
+    if err then return log.error("stop failed: " .. tostring(err)) end
+    log.info(s.name .. " stopped")
   end)
   lsp.start_clients(entries)
+end
+
+--- Remove the container of the current workspace (docker compose down for compose configs).
+--- The workspace files are not touched. Asks first.
+---@param opts? { confirm?: boolean }
+function M.down(opts)
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    local function remove()
+      local lsp = require("devcontainer.lsp")
+      local entries = lsp.stop_clients(s.local_folder, s.key)
+      M._teardown(s)
+      store.set(s.local_folder, "fingerprint", nil)
+      log.info("removing " .. s.name)
+      require("devcontainer.container").remove(s, function(err)
+        if err then return log.error("remove failed: " .. tostring(err)) end
+        log.info(s.name .. " removed")
+      end)
+      lsp.start_clients(entries)
+    end
+    if opts and opts.confirm == false then return remove() end
+    vim.ui.select({ "Remove", "Cancel" }, {
+      prompt = ("Remove the container of %s%s? The workspace files are kept."):format(
+        s.name, s.compose_project and (" (compose project " .. s.compose_project .. ")") or ""),
+      kind = "devcontainer.down",
+    }, function(choice)
+      if choice == "Remove" then remove() end
+    end)
+  end, "Remove devcontainer")
+end
+
+--- Open the devcontainer.json of the current workspace.
+function M.open_config()
+  local s = registry.current()
+  if s then return vim.cmd.edit(vim.fn.fnameescape(s.config_file)) end
+  local root = spec.find_root(start_path())
+  if not root then return log.warn("no devcontainer config here (:Devcontainer init creates one)") end
+  local configs = spec.list_configs(root)
+  if #configs == 1 then return vim.cmd.edit(vim.fn.fnameescape(configs[1])) end
+  vim.ui.select(configs, {
+    prompt = "Devcontainer configuration",
+    format_item = function(p) return p:sub(#root + 2) end,
+  }, function(p)
+    if p then vim.cmd.edit(vim.fn.fnameescape(p)) end
+  end)
 end
 
 local LOGIN_SHELL = 'shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; exec "${shell:-/bin/sh}" -l'

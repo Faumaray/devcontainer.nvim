@@ -14,8 +14,11 @@ M.defaults = {
   --   "ask" = offer to start it (answers "always"/"never" are remembered per project)
   --   true  = start it right away, false = only on :Devcontainer up
   autostart = "ask",
-  -- `docker stop` attached containers when Neovim exits
+  -- `docker stop` attached containers when Neovim exits (compose projects are stopped as a
+  -- whole; devcontainer.json `"shutdownAction": "none"` keeps a container running)
   stop_on_exit = false,
+  -- offer to rebuild when devcontainer.json / its Dockerfile / compose files change
+  watch_config = true,
   -- how to capture the container user's environment (PATH from nvm/sdkman/...):
   -- nil = devcontainer.json `userEnvProbe` (default "loginInteractiveShell"), or
   -- "none" | "loginShell" | "interactiveShell" | "loginInteractiveShell"

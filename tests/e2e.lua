@@ -91,6 +91,27 @@ local main_buf = vim.api.nvim_get_current_buf()
 check("host clangd attached", wait(10000, function() return #vim.lsp.get_clients({ bufnr = main_buf }) == 1 end))
 check("host client is not in a container", vim.lsp.get_clients({ bufnr = main_buf })[1].config._devcontainer_key == nil)
 
+local events = {}
+vim.api.nvim_create_autocmd("User", {
+  pattern = { "DevcontainerStarting", "DevcontainerAttached", "DevcontainerDetached" },
+  callback = function(ev) table.insert(events, { ev.match, ev.data }) end,
+})
+local answers = {} -- kind -> answer for vim.ui.select
+local orig_select = vim.ui.select
+vim.ui.select = function(items, o, cb)
+  local want = answers[o.kind or ""]
+  if want == nil then return orig_select(items, o, cb) end
+  answers[o.kind] = nil
+  cb(want)
+end
+
+-- a devcontainer:// buffer restored (by a session manager) before the container runs
+local restored = "devcontainer://fc0123456789" .. E .. "/container-only/note.txt"
+vim.cmd.edit(restored)
+local restored_buf = vim.api.nvim_get_current_buf()
+check("restored buffer waits for the container", vim.b[restored_buf].devcontainer_unread == true)
+vim.cmd.buffer(main_buf)
+
 -- 2. :Devcontainer up ------------------------------------------------------------------------
 vim.cmd("Devcontainer up")
 local session
@@ -103,6 +124,12 @@ check("remoteUser from image metadata", session.remote_user == "vscode", session
 check("remoteEnv substituted", session.env.MY_VAR == REMOTE .. "/x", session.env.MY_VAR)
 check("remoteEnv from metadata uses ${containerEnv}", session.env.FROM_META == vim.env.HOME .. "/meta", session.env.FROM_META)
 check("postCreateCommand ran", vim.uv.fs_stat(E .. "/post-create-ran") ~= nil)
+check("Starting and Attached events", wait(2000, function() return #events >= 2 end) and events[1][1] == "DevcontainerStarting"
+  and events[2][1] == "DevcontainerAttached" and events[2][2].local_folder == HOST and events[2][2].key == session.key, events)
+check("published ports read from docker inspect", session.published and session.published[9999] == 19999, session.published)
+check("restored devcontainer:// buffer read after attach", wait(2000, function()
+  return vim.api.nvim_buf_get_lines(restored_buf, 0, -1, false)[1] == "old" and not vim.b[restored_buf].devcontainer_unread
+end), vim.api.nvim_buf_get_lines(restored_buf, 0, -1, false))
 
 local client
 check("clangd restarted inside the container", wait(15000, function()
@@ -260,6 +287,22 @@ check("info/statusline/checkhealth run", pcall(function()
   vim.cmd("close")
 end))
 
+-- 7c. saving devcontainer.json offers a rebuild --------------------------------------------------
+vim.cmd.edit(HOST .. "/.devcontainer/devcontainer.json")
+answers["devcontainer.rebuild"] = "Rebuild now"
+vim.api.nvim_buf_set_lines(0, 0, 0, false, { "// edited" })
+vim.cmd("silent write")
+check("rebuild offered and done after saving the config", wait(20000, function()
+  local log_now = read(E .. "/docker.log") or ""
+  return answers["devcontainer.rebuild"] == nil and select(2, log_now:gsub('"run", "%-d"', "")) == 2
+    and require("devcontainer").get(HOST) ~= nil
+end), answers)
+session = require("devcontainer").get(HOST)
+check("clangd back in the rebuilt container", wait(15000, function()
+  local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
+  return c and c.config._devcontainer_key == session.key and c.initialized
+end))
+
 -- 8. :Devcontainer stop moves clangd back to the host ----------------------------------------
 vim.cmd.buffer(main_buf)
 vim.cmd("Devcontainer stop")
@@ -271,6 +314,22 @@ check("clangd back on the host", wait(10000, function()
   local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
   return c and c.config._devcontainer_key == nil and c.initialized
 end))
+check("Detached event", events[#events][1] == "DevcontainerDetached" and events[#events][2].local_folder == HOST, events[#events])
+
+-- 8b. the config changed while no Neovim was watching: `up` asks before reusing the container --
+write(HOST .. "/.devcontainer/devcontainer.json", (read(HOST .. "/.devcontainer/devcontainer.json") or "") .. "\n// changed on disk\n")
+answers["devcontainer.rebuild"] = "Start the existing container"
+vim.cmd.buffer(main_buf)
+vim.cmd("Devcontainer up")
+check("up asks about a container older than its config", wait(20000, function()
+  return answers["devcontainer.rebuild"] == nil and require("devcontainer").get(HOST) ~= nil
+end))
+check("existing container reused", select(2, (read(E .. "/docker.log") or ""):gsub('"run", "%-d"', "")) == 2)
+vim.cmd("Devcontainer stop")
+wait(10000, function()
+  local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
+  return c and c.config._devcontainer_key == nil and c.initialized
+end)
 
 -- 9. devcontainer CLI backend ----------------------------------------------------------------
 write(E .. "/bin/devcontainer", read(root .. "/tests/fake-devcontainer-cli.py"))
@@ -295,6 +354,13 @@ if session then
   loc = definition(3, 20)
   check("cli: definitions still map to host paths", loc and loc.uri == vim.uri_from_fname(HOST .. "/util.h"), loc)
 end
+
+-- 10. :Devcontainer down removes the container -------------------------------------------------
+vim.cmd.buffer(main_buf)
+require("devcontainer").down({ confirm = false })
+check("down: detached and container removed", require("devcontainer").get(HOST) == nil and wait(5000, function()
+  return (read(E .. "/docker.log") or ""):find('"rm", "-f", "cc0123456789', 1, true) ~= nil
+end))
 
 io.stdout:write(failures == 0 and "\nall e2e checks passed\n" or ("\n%d e2e checks failed\n"):format(failures))
 for _, c in ipairs(vim.lsp.get_clients()) do c:stop(true) end

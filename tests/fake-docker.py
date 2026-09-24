@@ -38,7 +38,11 @@ rest = args[1:]
 if cmd == "ps":
     s = load()
     if s.get("id"):
-        print(f"{s['id'][:12]} {'running' if s.get('running') else 'exited'}")
+        if "-aq" in rest or "-q" in rest:
+            if not any("com.docker.compose.project" in r for r in rest):
+                print(s["id"][:12])
+        else:
+            print(f"{s['id'][:12]} {'running' if s.get('running') else 'exited'}")
 elif cmd == "run":
     # a distinct id per workspace (the labels contain the local folder)
     cid = CID if not os.environ.get("FAKE_DOCKER_UNIQUE") else hashlib.sha256(" ".join(rest).encode()).hexdigest()
@@ -53,6 +57,17 @@ elif cmd == "rm":
     save({})
 elif cmd == "build":
     print("fake build ok")
+elif cmd == "inspect" and "-f" not in rest:
+    s = load()
+    if not s.get("id"):
+        print("[]")
+        sys.exit(1)
+    print(json.dumps([{
+        "Id": s["id"],
+        "Config": {"Labels": {"devcontainer.local_folder": "?"}},
+        "NetworkSettings": {"Ports": {"9999/tcp": [{"HostIp": "127.0.0.1", "HostPort": "19999"}]}},
+        "Mounts": [],
+    }]))
 elif cmd == "inspect":
     fmt = rest[rest.index("-f") + 1]
     if "devcontainer.metadata" in fmt:

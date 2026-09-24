@@ -15,6 +15,8 @@ local subcommands = {
     complete = function() return { "--no-cache" } end,
   },
   stop = { fn = function() dc().stop() end },
+  down = { fn = function() dc().down() end },
+  config = { fn = function() dc().open_config() end },
   exec = { fn = function(args) dc().exec(args) end },
   shell = { fn = function() dc().exec() end },
   log = { fn = function() require("devcontainer.log").open() end },
