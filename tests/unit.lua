@@ -610,5 +610,116 @@ test("docker backend: appPort published, forwardPorts tunnelled instead", functi
   assert(s:find("-p 9000:9001", 1, true), s)
 end)
 
+-- command API + integrations (against stub plugins) ------------------------------------------
+
+local function scratch_named(name)
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(buf, name)
+  return buf
+end
+
+test("wrap_cmd: exec argv with mapped paths, unchanged without a container", function()
+  local dcm = require("devcontainer")
+  local s = fake_session({})
+  session_mod.register(s)
+  local argv, got = dcm.wrap_cmd({ "/home/me/.local/share/nvim/mason/bin/ruff", "check", "/home/me/proj/a.py" },
+    { path = "/home/me/proj/a.py", cwd = "/home/me/proj/sub" })
+  eq(got, s)
+  eq(argv, { "docker", "exec", "-i", "-u", "vscode", "-w", "/workspaces/proj/sub", "-e", "PATH=/usr/local/bin:/usr/bin",
+    "0123456789abcdef", "ruff", "check", "/workspaces/proj/a.py" })
+  eq(dcm.wrap_cmd({ "./run.sh" }, { path = "/home/me/proj" })[11], "./run.sh", "relative paths are kept")
+  eq({ dcm.wrap_cmd({ "ls" }, { path = "/elsewhere" }) }, { { "ls" } })
+  eq(dcm.shell_cmd({ path = "/elsewhere" }), nil)
+  eq(dcm.shell_cmd({ path = "/home/me/proj" })[3], "-it")
+  session_mod.unregister(s)
+end)
+
+test("conform: formatters run in the container, host config outside", function()
+  local util = { merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end }
+  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = { cpp = { "clang_format" }, py = { { "black" } } } }
+  package.loaded["conform"], package.loaded["conform.util"] = conform, util
+  package.loaded["conform.formatters.clang_format"] = { command = "clang-format", args = { "--assume-filename", "$FILENAME" } }
+  package.loaded["conform.formatters.black"] = { command = "black", args = { "--stdin-filename", "$FILENAME", "-" } }
+  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format" })
+  session_mod.register(s)
+  require("devcontainer.integrations.conform").setup()
+  eq(type(conform.formatters.clang_format), "function")
+  eq(type(conform.formatters.black), "function")
+  local buf = scratch_named("/home/me/proj/src/a.cpp")
+  local cfg = conform.formatters.clang_format(buf)
+  eq({ cfg.command, cfg.inherit }, { "docker", false })
+  local args = cfg.args(cfg, { filename = "/home/me/proj/src/a.cpp", dirname = "/home/me/proj/src", buf = buf })
+  eq(vim.list_slice(args, #args - 2), { "/usr/bin/clang-format", "--assume-filename", "/workspaces/proj/src/a.cpp" })
+  eq(args[1], "exec")
+  -- black isn't in the container: host definition (with the user's override merged)
+  local b = conform.formatters.black(buf)
+  eq({ b.command, b.inherit }, { "black", false })
+  local out = scratch_named("/elsewhere/a.cpp")
+  eq(conform.formatters.clang_format(out).command, "clang-format")
+  require("devcontainer.integrations.conform").setup() -- idempotent
+  eq(conform.formatters.clang_format(buf).command, "docker")
+  session_mod.unregister(s)
+  package.loaded["conform"], package.loaded["conform.util"] = nil, nil
+end)
+
+test("nvim-lint: linters run in the container, output mapped back", function()
+  local lint = { linters_by_ft = { python = { "mypy" } }, linters = {
+    mypy = { cmd = "mypy", args = { "--show-column-numbers", function() return "--x" end }, stdin = false,
+      parser = function(output) return output end },
+  } }
+  package.loaded["lint"] = lint
+  local s = fake_session({ mypy = "/usr/local/bin/mypy" })
+  session_mod.register(s)
+  require("devcontainer.integrations.lint").setup()
+  local buf = scratch_named("/home/me/proj/a.py")
+  vim.api.nvim_set_current_buf(buf)
+  local l = lint.linters.mypy()
+  eq({ l.cmd, l.append_fname, l.name }, { "docker", false, "mypy" })
+  eq(vim.list_slice(l.args, #l.args - 3), { "/usr/local/bin/mypy", "--show-column-numbers", "--x", "/workspaces/proj/a.py" })
+  eq(l.parser("/workspaces/proj/a.py:1:2: error: x"), "/home/me/proj/a.py:1:2: error: x")
+  vim.api.nvim_set_current_buf(scratch_named("/elsewhere/b.py"))
+  eq(lint.linters.mypy().cmd, "mypy")
+  session_mod.unregister(s)
+  package.loaded["lint"] = nil
+end)
+
+test("neotest: spec transform maps workspace, temp files and host-only scripts", function()
+  local s = fake_session({})
+  local run = require("devcontainer.integrations.neotest").transform({
+    command = { "python3", "/plugins/neotest-python/neotest.py", "--results-file", "/tmp/nvim.me/x/5", "--",
+      "/home/me/proj/tests/test_a.py::test_x" },
+    cwd = "/home/me/proj",
+    env = { OUT = "/tmp/nvim.me/x/6" },
+  }, s, "/tmp/nvim.me/x", "/tmp/dcn/1", function(p) return p == "/plugins/neotest-python/neotest.py" end)
+  local hash = vim.fn.sha256("/plugins/neotest-python"):sub(1, 12)
+  eq(run.copy_in, { { host = "/plugins/neotest-python", remote = "/tmp/dcn/1/in/" .. hash } })
+  eq(run.cwd, "/home/me/proj")
+  local cmd = table.concat(run.command, " ")
+  assert(cmd:find("exec -it -u vscode -w /workspaces/proj -e OUT=/tmp/dcn/1/tmp/6", 1, true), cmd)
+  assert(cmd:find("python3 /tmp/dcn/1/in/" .. hash .. "/neotest.py --results-file /tmp/dcn/1/tmp/5 -- /workspaces/proj/tests/test_a.py::test_x", 1, true), cmd)
+end)
+
+test("terminal providers: builtin fallback, snacks, toggleterm, function", function()
+  local terminal = require("devcontainer.terminal")
+  config.set({ terminal = { provider = "snacks" } })
+  eq(terminal.provider(), "builtin", "snacks not installed")
+  local calls = {}
+  _G.Snacks = { terminal = { open = function(argv, o) table.insert(calls, { "snacks", argv, o.cwd }); return { buf = vim.api.nvim_create_buf(false, true) } end } }
+  terminal.open({ "a", "b c" }, { cwd = "/x" })
+  eq(calls[1], { "snacks", { "a", "b c" }, "/x" })
+  package.loaded["toggleterm.terminal"] = { Terminal = { new = function(_, o)
+    table.insert(calls, { "toggleterm", o.cmd, o.dir })
+    return { toggle = function() end }
+  end } }
+  config.set({ terminal = { provider = "toggleterm" } })
+  terminal.open({ "a", "b c" }, { cwd = "/x" })
+  eq(calls[2], { "toggleterm", "'a' 'b c'", "/x" })
+  config.set({ terminal = { provider = function(argv) table.insert(calls, { "fn", argv }) end } })
+  terminal.open({ "z" })
+  eq(calls[3], { "fn", { "z" } })
+  _G.Snacks, package.loaded["toggleterm.terminal"] = nil, nil
+  config.set({})
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

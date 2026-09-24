@@ -400,12 +400,50 @@ function M.exec(cmd)
   local dir = vim.fn.expand("%:p:h")
   registry.pick(function(s)
     if not s then return log.warn("no devcontainer attached — run :Devcontainer up") end
-    local argv = (cmd and vim.trim(cmd) ~= "") and { "/bin/sh", "-lc", cmd } or { "/bin/sh", "-c", LOGIN_SHELL }
+    local interactive = not (cmd and vim.trim(cmd) ~= "")
+    local argv = interactive and { "/bin/sh", "-c", LOGIN_SHELL } or { "/bin/sh", "-lc", cmd }
     local cwd = (dir ~= "" and s:remote_path(dir)) or s.remote_folder
-    vim.cmd("botright new")
-    vim.fn.jobstart(s:exec_argv(argv, { tty = true, cwd = cwd }), { term = true, cwd = s.local_folder })
-    vim.cmd("startinsert")
+    require("devcontainer.terminal").open(s:exec_argv(argv, { tty = true, cwd = cwd }), {
+      cwd = s.local_folder,
+      title = interactive and s.name or cmd,
+    })
   end, "Devcontainer")
+end
+
+--- `argv` wrapped to run in the devcontainer of `opts.path` (default: the current buffer / cwd):
+--- a `docker exec` command with host workspace paths in the arguments translated. Returns `argv`
+--- unchanged (and no session) when there is no attached devcontainer. For your own jobs, terminal
+--- plugins, test runners, ...
+---
+---   local argv = require("devcontainer").wrap_cmd({ "make", "-C", vim.fn.getcwd() .. "/sub" })
+---@param argv string[]
+---@param opts? { path?: string, cwd?: string, env?: table<string,string>, tty?: boolean, stdin?: boolean }
+---@return string[] argv, devcontainer.Session? session
+function M.wrap_cmd(argv, opts)
+  opts = opts or {}
+  local s
+  if opts.path or opts.cwd then
+    s = registry.find(opts.path or opts.cwd)
+  else
+    s = registry.current()
+  end
+  if not s then return argv, nil end
+  local cmd = {}
+  for i, a in ipairs(argv) do cmd[i] = s:map_arg(a) end
+  -- absolute host path outside the workspace (mason, ...): look it up by name in the container
+  if type(cmd[1]) == "string" and cmd[1]:sub(1, 1) == "/" and cmd[1] == argv[1] then cmd[1] = vim.fs.basename(cmd[1]) end
+  local cwd = opts.cwd and (s:remote_path(opts.cwd) or s.remote_folder) or nil
+  return s:exec_argv(cmd, { tty = opts.tty, stdin = opts.stdin ~= false, cwd = cwd, env = opts.env }), s
+end
+
+--- Login shell of the remote user in the devcontainer of `opts.path` (default: current buffer),
+--- for terminal plugins: `Snacks.terminal(require("devcontainer").shell_cmd())`.
+---@param opts? { path?: string, cwd?: string }
+---@return string[]? argv  nil when no devcontainer is attached
+function M.shell_cmd(opts)
+  opts = opts or {}
+  local argv, s = M.wrap_cmd({ "/bin/sh", "-c", LOGIN_SHELL }, { path = opts.path, cwd = opts.cwd, tty = true })
+  return s and argv or nil
 end
 
 function M.info()

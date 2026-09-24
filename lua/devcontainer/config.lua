@@ -34,6 +34,11 @@ M.defaults = {
   -- read customizations["devcontainer.nvim"] (settings / profiles shared by the team) from
   -- devcontainer.json; the file has to be trusted first (:help vim.secure.read)
   customizations = true,
+  terminal = {
+    -- where :Devcontainer shell / exec and `run` tasks open: "builtin" (a split) | "snacks" |
+    -- "toggleterm" | fun(argv, { cwd, env, title, height, on_exit })
+    provider = "builtin",
+  },
   ports = {
     -- forward devcontainer.json `forwardPorts` when attaching (:Devcontainer forward for others)
     forward = true,

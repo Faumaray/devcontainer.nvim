@@ -175,18 +175,17 @@ local function set_qf(spec, items)
 end
 
 local function builtin_interactive(spec, done)
-  vim.cmd(("botright %dnew"):format(config.options.project.output_height))
   local s = session_of(spec)
-  vim.fn.jobstart(M.argv(spec, true), {
-    term = true,
+  require("devcontainer.terminal").open(M.argv(spec, true), {
     cwd = s and spec.cwd or (spec.exec_cwd or spec.cwd),
     env = not s and spec.env or nil,
-    on_exit = function(_, code)
+    title = spec.name,
+    height = config.options.project.output_height,
+    on_exit = function(code)
       after(spec, code == 0)
       done(code == 0)
     end,
   })
-  vim.cmd.startinsert()
 end
 
 local function builtin(spec, done)
