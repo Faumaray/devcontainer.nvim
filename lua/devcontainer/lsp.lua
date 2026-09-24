@@ -46,11 +46,67 @@ local get_workspace_folders = vim.lsp._get_workspace_folders or function(folders
   if type(folders) == "string" then return { { uri = vim.uri_from_fname(folders), name = folders } } end
 end
 
+--- Arguments that name the compilation database dir: clangd's --compile-commands-dir.
+local function cdb_arg(argv)
+  for i = 2, #argv do
+    local a = argv[i]
+    if type(a) == "string" then
+      local v = a:match("^%-%-compile%-commands%-dir=(.*)$")
+      if v then return i, v, true end
+      if a == "--compile-commands-dir" and type(argv[i + 1]) == "string" then return i + 1, argv[i + 1], false end
+    end
+  end
+end
+
+local function inside(path, folder)
+  return path == folder or path:sub(1, #folder + 1) == folder .. "/"
+end
+
+--- A server told where compile_commands.json is (clangd --compile-commands-dir, or
+--- init_options.compilationDatabasePath) follows the active build dir of its project: `build`
+--- becomes `build/Debug`, the dir of the selected profile / preset, ... Only relative dirs and dirs
+--- inside the project are followed. Host paths (the container translation maps them).
+---@param argv string[] host command
+---@param cfg table config (root_dir, init_options)
+---@return string[] argv, table? init_options, { dir: string, ready: boolean }? cdb
+function M.remap_compile_commands(argv, cfg)
+  local root = M.root_of(cfg)
+  if not root or config.get(root).lsp.follow_build_dir == false then return argv end
+  local idx, given, joined = cdb_arg(argv)
+  local io_path = type(cfg.init_options) == "table" and cfg.init_options.compilationDatabasePath
+  if not idx and type(io_path) ~= "string" then return argv end
+  local dir, ctx = require("devcontainer.project").compile_commands_dir(root)
+  if not dir then return argv end
+  local function follows(p)
+    return type(p) == "string" and (p:sub(1, 1) ~= "/" or inside(vim.fs.normalize(p), ctx.root))
+  end
+  local new_argv, init_options = argv, nil
+  if idx and follows(given) then
+    new_argv = vim.list_extend({}, argv)
+    new_argv[idx] = joined and ("--compile-commands-dir=" .. dir) or dir
+  end
+  if follows(io_path) then
+    init_options = vim.tbl_extend("force", {}, cfg.init_options, { compilationDatabasePath = dir })
+  end
+  if new_argv == argv and not init_options then return argv end
+  return new_argv, init_options, { dir = dir, ready = vim.uv.fs_stat(dir .. "/compile_commands.json") ~= nil }
+end
+
 --- argv to run inside the container, or nil when the server isn't installed there.
-local function remote_argv(session, name, host_cmd)
+local function remote_argv(session, name, host_cmd, cfg)
   local override = opts(session.local_folder).remote_cmd[name]
   if type(override) == "function" then override = override(host_cmd, session) end
-  if type(override) == "table" then return override end
+  if type(override) == "table" then
+    if not cdb_arg(override) then return override end
+    -- its --compile-commands-dir follows the build dir too: remap in host paths, then map back
+    local replace_root = require("devcontainer.paths").replace_root
+    local as_host = vim.tbl_map(function(a)
+      return type(a) == "string" and replace_root(a, session.remote_folder, session.local_folder) or a
+    end, override)
+    local remapped, _, cdb = M.remap_compile_commands(as_host, cfg)
+    if remapped == as_host then return override end
+    return vim.tbl_map(function(a) return session:map_arg(a) end, remapped), cdb
+  end
 
   local bin = host_cmd[1]
   local found = session:which(bin)
@@ -120,8 +176,10 @@ local function remote_start_fn(key, argv)
   return function(dispatchers, cfg)
     local session = registry.by_key[key]
     if not session then error("devcontainer " .. key .. " is not attached", 0) end
+    -- like on the host: cmd_cwd, else Neovim's cwd (so relative arguments mean the same thing)
+    local cwd = cfg.cmd_cwd or vim.fn.getcwd()
     return M.rpc(session, argv, dispatchers, {
-      cwd = cfg.cmd_cwd and (session.lsp:path_to_remote(cfg.cmd_cwd) or nil),
+      cwd = session.lsp:path_to_remote(cwd) or nil,
       env = cfg.cmd_env,
     })
   end
@@ -147,14 +205,21 @@ function M.rewrite(cfg)
   new._devcontainer_host_cmd = host_cmd
   new._devcontainer_key = nil
 
+  -- --compile-commands-dir / compilationDatabasePath follow the project's active build dir
+  local argv_host, init_options, cdb = M.remap_compile_commands(host_cmd, cfg)
+  if init_options then new.init_options = init_options end
+  new._devcontainer_cdb = cdb
+  local host_start = (cfg._devcontainer_host_cmd or argv_host ~= host_cmd) and argv_host or cfg.cmd
+
   if not session then
     -- installed only in the container (lsp_cmd, or a config adopted while attached): wait for it
     if vim.fn.executable(host_cmd[1]) == 0 then return nil end
-    new.cmd = cfg._devcontainer_host_cmd and host_cmd or cfg.cmd
+    new.cmd = host_start
     return new
   end
 
-  local argv = remote_argv(session, name, host_cmd)
+  local argv, override_cdb = remote_argv(session, name, argv_host, cfg)
+  new._devcontainer_cdb = cdb or override_cdb
   if not argv then
     local fallback = opts(session.local_folder).fallback
     if not session.warned[name] then
@@ -165,12 +230,13 @@ function M.rewrite(cfg)
       ))
     end
     if fallback ~= "local" then return nil end
-    new.cmd = cfg._devcontainer_host_cmd and host_cmd or cfg.cmd
+    new.cmd = host_start
     return new
   end
 
   new.cmd = remote_start_fn(session.key, argv)
   new._devcontainer_key = session.key
+  new._devcontainer_argv = argv -- what runs in the container (for :Devcontainer info, tests)
   return new
 end
 
@@ -265,10 +331,6 @@ function M.attach_remote_buffer(bufnr, session)
   end
 end
 
-local function inside(path, folder)
-  return path == folder or path:sub(1, #folder + 1) == folder .. "/"
-end
-
 --- Executables of the running clients whose workspace is `folder` (or below): what `up` has to
 --- look up in the container before moving them (see Session:prefetch).
 function M.binaries(folder)
@@ -288,8 +350,10 @@ end
 ---@field bufs integer[]
 
 --- Stop every client whose workspace is `folder` (or below), remembering its buffers.
+---@param key? string  also the clients of this container
+---@param filter? fun(client: vim.lsp.Client): boolean  only these
 ---@return devcontainer.LspEntry[]
-function M.stop_clients(folder, key)
+function M.stop_clients(folder, key, filter)
   local entries = {}
   local roots = { folder, vim.uv.fs_realpath(folder) }
   for _, c in ipairs(vim.lsp.get_clients()) do
@@ -298,7 +362,7 @@ function M.stop_clients(folder, key)
     for _, r in ipairs(roots) do
       match = match or (root and inside(root, r))
     end
-    if match and not c:is_stopped() then
+    if match and not c:is_stopped() and (not filter or filter(c)) then
       entries[#entries + 1] = { client = c, config = c.config, bufs = vim.tbl_keys(c.attached_buffers) }
       c:stop()
     end
@@ -309,8 +373,8 @@ end
 -- folder -> the move in progress: its clients are still exiting
 local moves = {}
 
---- Wait (≤3s) for the stopped clients to exit, then start them again for their buffers.
---- Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
+--- Wait for the stopped clients to exit (killed after 3s), then start them again for their
+--- buffers. Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
 ---
 --- One move per workspace: a newer one (stop right after up, up with another backend, ...) takes
 --- over the clients of the one still waiting, instead of both starting them when their timers fire.
@@ -318,6 +382,7 @@ local moves = {}
 ---@param after? fun()  called once the clients have been started again
 ---@param folder? string  workspace the move belongs to
 function M.start_clients(entries, after, folder)
+  local afters = {}
   local previous = folder and moves[folder]
   if previous then
     previous.cancel()
@@ -329,13 +394,15 @@ function M.start_clients(entries, after, folder)
         entries[#entries + 1] = e
       end
     end
+    vim.list_extend(afters, previous.afters) -- e.g. up's start of servers that couldn't run before
   end
-  if #entries == 0 then
-    if after then after() end
-    return
+  table.insert(afters, after)
+  local function finish()
+    for _, fn in ipairs(afters) do fn() end
   end
+  if #entries == 0 then return finish() end
   local timer = assert(vim.uv.new_timer())
-  local move = { entries = entries }
+  local move = { entries = entries, afters = afters }
   function move.cancel()
     if not timer:is_closing() then
       timer:stop()
@@ -344,14 +411,21 @@ function M.start_clients(entries, after, folder)
     if folder and moves[folder] == move then moves[folder] = nil end
   end
   if folder then moves[folder] = move end
-  local waited = 0
+  local waited, killed = 0, false
   timer:start(0, 100, vim.schedule_wrap(function()
     if timer:is_closing() then return end
     waited = waited + 100
-    local pending = vim.tbl_filter(function(e) return not e.client:is_stopped() end, entries)
+    -- is_stopped() is true as soon as stop() was called; until the client is gone it is still
+    -- attached, and requests to its buffers would wait for the exiting server too
+    local pending = vim.tbl_filter(function(e) return vim.lsp.get_client_by_id(e.client.id) ~= nil end, entries)
     if #pending > 0 and waited < 3000 then return end
+    if #pending > 0 and not killed then
+      killed = true
+      -- stop(true) is a no-op on 0.11 for a client that is already stopping
+      for _, e in ipairs(pending) do pcall(function() e.client.rpc.terminate() end) end
+    end
+    if #pending > 0 and waited < 5000 then return end
     move.cancel()
-    for _, e in ipairs(pending) do e.client:stop(true) end
 
     for _, e in ipairs(entries) do
       local host_cmd = host_cmd_of(e.config)
@@ -367,7 +441,7 @@ function M.start_clients(entries, after, folder)
         end
       end
     end
-    if after then after() end
+    finish()
   end))
 end
 
@@ -405,6 +479,23 @@ function M.retrigger(folder)
       end
     end
   end
+end
+
+--- Restart the clients below `root` that follow the build dir (see M.remap_compile_commands)
+--- when the active build dir changed and has a compile_commands.json, or when the database they
+--- were started without now exists (first configure).
+function M.refresh_compile_commands(root)
+  local project = require("devcontainer.project")
+  local entries = M.stop_clients(root, nil, function(c)
+    local cdb = c.config._devcontainer_cdb
+    if not cdb then return false end
+    local dir = project.compile_commands_dir(M.root_of(c.config) or root)
+    if not dir or not vim.uv.fs_stat(dir .. "/compile_commands.json") then return false end
+    return dir ~= cdb.dir or not cdb.ready
+  end)
+  if #entries == 0 then return end
+  local s = registry.find(root)
+  M.start_clients(entries, nil, s and s.local_folder or root)
 end
 
 --- Move every client of `folder` to wherever it should run now (container or host).

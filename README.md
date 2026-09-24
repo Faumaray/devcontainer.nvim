@@ -158,6 +158,8 @@ require("devcontainer").setup({
                            --   { clangd = { "clangd-18", "--background-index", "--clang-tidy" } }
                            -- or a function(host_cmd, session) -> argv
     fallback = "local",    -- server missing in the container: "local" (run on host, warn) | "none"
+    follow_build_dir = true, -- --compile-commands-dir / compilationDatabasePath follow the active
+                           -- build dir (build/Debug, a profile's dir, ...); false keeps them as written
   },
   project = {
     runner = "auto",       -- "auto" (overseer.nvim when installed) | "overseer" | "builtin"
@@ -223,7 +225,8 @@ cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" })
 
 Absolute host paths such as mason's `~/.local/share/nvim/mason/bin/clangd` are looked up by their
 basename inside the container. Arguments that contain your workspace path (for example
-`--compile-commands-dir=/home/me/proj/build`) are rewritten to the container path.
+`--query-driver=/home/me/proj/tools/*`) are rewritten to the container path, and
+`--compile-commands-dir` follows the project's active build dir (see [Building projects](#building-projects)).
 
 ## Commands
 
@@ -348,6 +351,11 @@ so servers that only listen on the container's `localhost` work, and so do compo
 - `CMAKE_EXPORT_COMPILE_COMMANDS=ON` is always passed. After a successful configure,
   `<build>/compile_commands.json` is symlinked into the project root so clangd (running in the
   same container) finds it. An existing regular `compile_commands.json` is never touched.
+- A server that is told where the database is, like clangd with `--compile-commands-dir=build`
+  (or `init_options.compilationDatabasePath`), gets the active build dir instead: `build/Debug`,
+  the selected profile's or preset's dir. It restarts when that dir changes (profile, preset or
+  build type switch) or after its first configure. Dirs outside the project are left alone;
+  `lsp.follow_build_dir = false` turns this off.
 - Executable targets come from the CMake File API, which is queried automatically.
 
 **Cargo**

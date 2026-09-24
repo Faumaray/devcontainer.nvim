@@ -105,23 +105,70 @@ cmake_minimum_required(VERSION 3.20)
 project(sgsn CXX)
 set(CMAKE_CXX_STANDARD 23)
 add_executable(sgsn_app src/main.cpp)
+target_include_directories(sgsn_app PRIVATE include)
 enable_testing()
 add_test(NAME smoke COMMAND sgsn_app)
 ]])
 local GOOD_CPP = [[
 #include <cstdio>
 #include <unistd.h>
+#include "proj_only.h"
 int main(int argc, char**) {
   char buf[4096];
   getcwd(buf, sizeof buf);
   std::printf("hello from sgsn cwd=%s args=%d\n", buf, argc - 1);
-  return 0;
+  return proj_only();
 }
 ]]
 write(CM .. "/src/main.cpp", GOOD_CPP)
+-- only reachable through the compile database (-I include)
+write(CM .. "/include/proj_only.h", "#pragma once\ninline int proj_only() { return 0; }\n")
+
+-- clangd told to use `build`, while the build dir is build/Debug (or a profile's)
+local have_clangd = vim.fn.executable("clangd") == 1
+if have_clangd then
+  vim.lsp.config("clangd", {
+    cmd = { "clangd", "--compile-commands-dir=build", "--log=error" },
+    filetypes = { "cpp" },
+    root_markers = { ".devcontainer" },
+  })
+  vim.lsp.enable("clangd")
+end
+local function clangd(buf)
+  for _, c in ipairs(vim.lsp.get_clients({ bufnr = buf, name = "clangd" })) do
+    if not c:is_stopped() and c.initialized then return c end
+  end
+end
+local function cdb_dir(buf)
+  local c = clangd(buf)
+  for _, a in ipairs(c and c.config._devcontainer_argv or {}) do
+    local d = a:match("^%-%-compile%-commands%-dir=(.*)$")
+    if d then return d end
+  end
+end
+--- go to definition of proj_only(): resolves only when clangd has the compile flags
+local function proj_only_definition(buf)
+  local c = clangd(buf)
+  if not c then return nil end
+  local res = c:request_sync("textDocument/definition", {
+    textDocument = { uri = vim.uri_from_bufnr(buf) },
+    position = { line = 7, character = 10 },
+  }, 15000, buf)
+  local r = res and res.result
+  local loc = r and (r[1] or r)
+  return loc and (loc.uri or loc.targetUri)
+end
+
 local s = attach(CM)
 check("cmake: container attached", s ~= nil)
 vim.cmd.edit(CM .. "/src/main.cpp")
+local main_buf = vim.api.nvim_get_current_buf()
+if have_clangd then
+  check("clangd: --compile-commands-dir points at the build dir in the container", wait(15000, function()
+    return cdb_dir(main_buf) == CM_REMOTE .. "/build/Debug"
+  end), cdb_dir(main_buf))
+  check("clangd: not configured yet, so no compile flags", proj_only_definition(main_buf) == nil)
+end
 
 local res = run("Devcontainer build")
 check("cmake: build (auto-configure) succeeds", res.ok == true, res)
@@ -133,6 +180,15 @@ check("cmake: compile_commands.json linked for clangd",
   vim.uv.fs_readlink(CM .. "/compile_commands.json") == "build/Debug/compile_commands.json")
 check("cmake: compile database has container paths", (read(CM .. "/compile_commands.json") or ""):find(CM_REMOTE .. "/src/main.cpp", 1, true) ~= nil)
 check("cmake: targets for completion", vim.tbl_contains(require("devcontainer.project").complete_targets("sgsn"), "sgsn_app"))
+if have_clangd then
+  local def
+  check("clangd: restarted after the first configure, uses the build dir's database", wait(20000, function()
+    local c = clangd(main_buf)
+    if not (c and c.config._devcontainer_cdb and c.config._devcontainer_cdb.ready) then return false end
+    def = proj_only_definition(main_buf)
+    return def == vim.uri_from_fname(CM .. "/include/proj_only.h")
+  end), def)
+end
 
 -- profiles: the selected profile picks the build dir and adds configure args
 require("devcontainer").add_profiles({
@@ -145,7 +201,17 @@ log = read(E .. "/docker.log") or ""
 check("profile: build configured the profile's build dir with its args", res.ok == true
   and log:find('"build/asan%-Debug"[^\n]*"%-DDC_PROFILE=asan"') ~= nil and res.name == "cmake build (Debug, asan)", res)
 check("profile: compile_commands.json follows the profile", vim.uv.fs_readlink(CM .. "/compile_commands.json") == "build/asan-Debug/compile_commands.json")
+if have_clangd then
+  check("clangd: follows the profile's build dir", wait(20000, function()
+    return cdb_dir(main_buf) == CM_REMOTE .. "/build/asan-Debug"
+  end), cdb_dir(main_buf))
+end
 vim.cmd("Devcontainer profile none")
+if have_clangd then
+  check("clangd: back to build/Debug with the profile", wait(20000, function()
+    return cdb_dir(main_buf) == CM_REMOTE .. "/build/Debug"
+  end), cdb_dir(main_buf))
+end
 local n_configure = select(2, log:gsub('"cmake", "%-S"', ""))
 res = run("Devcontainer build")
 log = read(E .. "/docker.log") or ""

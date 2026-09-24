@@ -25,6 +25,7 @@ local M = {}
 ---@field settings? fun(ctx: devcontainer.ProjectCtx)              interactive configuration (may yield)
 ---@field describe? fun(ctx: devcontainer.ProjectCtx): string
 ---@field after? fun(ctx: devcontainer.ProjectCtx, action: string)  runs after a successful task
+---@field compile_commands_dir? fun(ctx: devcontainer.ProjectCtx): string?  host dir of the active compile_commands.json
 
 ---@type devcontainer.Provider[]
 M.providers = {}
@@ -259,8 +260,18 @@ function M.select()
   if not ctx then return log.warn("no CMake or Cargo project found") end
   if not ctx.provider.settings then return log.info(ctx.provider.name .. " has nothing to select") end
   async.run(function() ctx.provider.settings(ctx) end, function(err)
-    if err then log.error(tostring(err)) end
+    if err then return log.error(tostring(err)) end
+    -- another preset / build type: servers following the build dir move to its database
+    require("devcontainer.lsp").refresh_compile_commands(ctx.root)
   end)
+end
+
+--- Host dir of the active compile_commands.json of the project around `path`, or nil.
+function M.compile_commands_dir(path)
+  local ctx = M.detect(path)
+  if not (ctx and ctx.provider.compile_commands_dir) then return nil end
+  local ok, dir = pcall(ctx.provider.compile_commands_dir, ctx)
+  return ok and dir or nil, ctx
 end
 
 --- Target names for command-line completion.
