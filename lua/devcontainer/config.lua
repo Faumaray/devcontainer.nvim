@@ -34,6 +34,35 @@ M.defaults = {
   -- read customizations["devcontainer.nvim"] (settings / profiles shared by the team) from
   -- devcontainer.json; the file has to be trusted first (:help vim.secure.read)
   customizations = true,
+  git = {
+    -- make the host's SSH agent available in new containers (SSH_AUTH_SOCK), see :help devcontainer-git
+    ssh_agent = true,
+    -- copy ~/.gitconfig into the container when it has none: true | false | path of the file to copy
+    gitconfig = true,
+  },
+  dotfiles = {
+    -- "owner/repo" (GitHub) or any git URL, cloned into new containers
+    repository = nil,
+    target_path = "~/dotfiles",
+    -- default: the first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup; without
+    -- one, the repository's dotfiles are linked into $HOME
+    install_command = nil,
+  },
+  -- progress of :Devcontainer up (image build, lifecycle hooks):
+  -- "auto" (fidget.nvim, else snacks.nvim's notifier when enabled, else echo) | "fidget" | "snacks" | "echo" | false
+  progress = "auto",
+  -- picker for :Devcontainer files: "auto" (snacks.picker, telescope, fzf-lua, else vim.ui.select)
+  -- | "snacks" | "telescope" | "fzf-lua" | "select"
+  picker = "auto",
+  files = {
+    -- folders offered by :Devcontainer files without an argument (globs; ~ = remote user's home)
+    roots = {
+      "/usr/include", "/usr/local/include", "/opt",
+      "~/.cargo/registry/src", "~/.rustup/toolchains",
+      "/usr/lib/python3*/site-packages", "/usr/local/lib/python3*/site-packages", "~/.local/lib/python3*/site-packages",
+      "/usr/local/go/src", "~/go/pkg/mod", "/usr/local/lib/node_modules", "/usr/lib/jvm",
+    },
+  },
   terminal = {
     -- where :Devcontainer shell / exec and `run` tasks open: "builtin" (a split) | "snacks" |
     -- "toggleterm" | fun(argv, { cwd, env, title, height, on_exit })

@@ -21,6 +21,7 @@ end
 local E = "/tmp/dc-int"
 local HOST, REMOTE = E .. "/host/proj", E .. "/workspaces/proj"
 vim.fn.delete(E, "rf")
+vim.env.XDG_DATA_HOME, vim.env.XDG_STATE_HOME = E .. "/data", E .. "/state"
 for _, d in ipairs({ HOST .. "/.devcontainer", REMOTE, E .. "/bin", E .. "/cbin" }) do vim.fn.mkdir(d, "p") end
 
 local function write(path, text, mode)
@@ -160,6 +161,122 @@ if have("neotest") and have("nvim-nio") and have("plenary.nvim") then
 else
   io.stdout:write("skip neotest (needs neotest, nvim-nio and plenary.nvim in $PLUGINS)\n")
 end
+
+-- snacks.nvim: picker, terminal, notifier progress ------------------------------------------------
+local dcm = require("devcontainer")
+local o = require("devcontainer.config").options
+local function buf_text(buf) return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n") end
+if have("snacks.nvim") then
+  require("snacks").setup({ picker = { enabled = true }, terminal = { enabled = true }, notifier = { enabled = true } })
+  o.picker = "snacks"
+  vim.cmd("Devcontainer files " .. E .. "/cbin")
+  local picker
+  check("snacks: picker lists container-only files", wait(10000, function()
+    picker = Snacks.picker.get({ source = "devcontainer_files" })[1]
+    return picker ~= nil and #picker:items() == 2
+  end), picker and picker:items())
+  if picker then
+    picker:action("confirm")
+    check("snacks: confirm opens a devcontainer:// buffer", wait(5000, function()
+      return vim.api.nvim_buf_get_name(0):find("^devcontainer://" .. session.key .. vim.pesc(E) .. "/cbin/") ~= nil
+    end), vim.api.nvim_buf_get_name(0))
+  end
+  o.terminal.provider = "snacks"
+  vim.cmd.buffer(main_buf)
+  vim.cmd("Devcontainer exec echo hi-from-snacks-$IN_CONTAINER")
+  local tbuf = vim.api.nvim_get_current_buf()
+  check("snacks: exec opens a snacks terminal in the container", wait(5000, function()
+    return vim.b[tbuf].snacks_terminal ~= nil and buf_text(tbuf):find("hi-from-snacks-yes", 1, true) ~= nil
+  end), buf_text(tbuf))
+  vim.cmd("stopinsert")
+  pcall(vim.api.nvim_buf_delete, tbuf, { force = true })
+  o.progress = "snacks"
+  local p = require("devcontainer.progress").start("devcontainer test")
+  p:report("building", 10)
+  check("snacks: progress shown by the notifier", wait(2000, function()
+    for _, n in ipairs(Snacks.notifier.get_history({ filter = function(n) return n.id == "devcontainer_progress_devcontainer test" end }) or {}) do
+      if tostring(n.msg):find("building", 1, true) then return true end
+    end
+    return false
+  end))
+  p:finish(true)
+  o.progress, o.picker, o.terminal.provider = "auto", "auto", "builtin"
+else
+  io.stdout:write("skip snacks.nvim (not in $PLUGINS)\n")
+end
+
+-- telescope ---------------------------------------------------------------------------------------
+if have("plenary.nvim") and have("telescope.nvim") then
+  o.picker = "telescope"
+  vim.cmd.buffer(main_buf)
+  vim.cmd("Devcontainer files " .. E .. "/cbin")
+  local prompt
+  check("telescope: picker lists container-only files", wait(10000, function()
+    prompt = vim.bo.filetype == "TelescopePrompt" and vim.api.nvim_get_current_buf() or nil
+    if not prompt then return false end
+    local picker = require("telescope.actions.state").get_current_picker(prompt)
+    return picker and picker.manager and picker.manager:num_results() == 2 and picker:get_selection() ~= nil
+  end))
+  if prompt then
+    vim.cmd("stopinsert")
+    require("telescope.actions").select_default(prompt)
+    check("telescope: selection opens a devcontainer:// buffer", wait(5000, function()
+      return vim.api.nvim_buf_get_name(0):find("^devcontainer://" .. session.key) ~= nil
+    end), vim.api.nvim_buf_get_name(0))
+  end
+  o.picker = "auto"
+else
+  io.stdout:write("skip telescope.nvim (not in $PLUGINS)\n")
+end
+
+-- toggleterm --------------------------------------------------------------------------------------
+if have("toggleterm.nvim") then
+  require("toggleterm").setup({})
+  o.terminal.provider = "toggleterm"
+  vim.cmd.buffer(main_buf)
+  vim.cmd("Devcontainer exec echo hi-from-toggleterm-$IN_CONTAINER")
+  local tbuf = vim.api.nvim_get_current_buf()
+  check("toggleterm: exec runs in the container", wait(5000, function()
+    return vim.bo[tbuf].filetype == "toggleterm" and buf_text(tbuf):find("hi-from-toggleterm-yes", 1, true) ~= nil
+  end), buf_text(tbuf))
+  o.terminal.provider = "builtin"
+else
+  io.stdout:write("skip toggleterm.nvim (not in $PLUGINS)\n")
+end
+
+-- fidget ------------------------------------------------------------------------------------------
+if have("fidget.nvim") then
+  require("fidget").setup({})
+  check("fidget: picked by progress = auto", require("devcontainer.progress").backend() == "fidget")
+  -- fidget keeps no history without a UI: look at the handle itself
+  local handle_mod = require("fidget.progress.handle")
+  local orig_create, handle = handle_mod.create, nil
+  handle_mod.create = function(m)
+    handle = orig_create(m)
+    return handle
+  end
+  local p = require("devcontainer.progress").start("devcontainer test")
+  p:feed({ "#5 [2/4] RUN make" })
+  check("fidget: progress reported", wait(2000, function()
+    return handle ~= nil and handle.message == "[2/4] RUN make" and handle.percentage == 50
+  end), handle and { handle.message, handle.percentage })
+  p:finish(true, "attached")
+  check("fidget: progress finished", wait(2000, function() return handle ~= nil and handle.done == true end))
+  handle_mod.create = orig_create
+else
+  io.stdout:write("skip fidget.nvim (not in $PLUGINS)\n")
+end
+
+check("checkhealth runs with the integrations loaded", pcall(vim.cmd, "checkhealth devcontainer"))
+local health = ""
+wait(10000, function() -- filled asynchronously on newer Neovim
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.bo[b].filetype == "checkhealth" then health = buf_text(b) end
+  end
+  return health:find("attached containers", 1, true) ~= nil
+end)
+check("checkhealth reports the relay and the integrations", health:find("port forwarding relay", 1, true) ~= nil
+  and health:find("conform.nvim found", 1, true) ~= nil and not health:find("ERROR", 1, true), health)
 
 io.stdout:write(failures == 0 and "\nall integration e2e checks passed\n" or ("\n%d integration e2e checks failed\n"):format(failures))
 os.exit(failures == 0 and 0 or 1)

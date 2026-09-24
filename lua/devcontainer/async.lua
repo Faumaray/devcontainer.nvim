@@ -46,6 +46,14 @@ function M.check(cmd, opts)
   return res
 end
 
+function M.input(opts)
+  local co = assert(coroutine.running())
+  vim.ui.input(opts, function(value)
+    vim.schedule(function() resume(co, value) end)
+  end)
+  return coroutine.yield()
+end
+
 function M.select(items, opts)
   local co = assert(coroutine.running())
   vim.ui.select(items, opts, function(choice)

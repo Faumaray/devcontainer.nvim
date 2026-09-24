@@ -10,12 +10,22 @@ local function clean(s)
   return s
 end
 
+local subscribers = {}
+
+--- Call `fn(lines)` for everything appended from now on (from luv callbacks too: keep it fast).
+---@return fun() unsubscribe
+function M.subscribe(fn)
+  subscribers[fn] = true
+  return function() subscribers[fn] = nil end
+end
+
 --- Append raw output (build logs, stderr, ...) to the log buffer. Safe to call from luv callbacks.
 function M.append(data)
   if type(data) ~= "string" or data == "" then
     return
   end
   local new = vim.split(clean(data), "\n", { plain = true, trimempty = true })
+  for fn in pairs(subscribers) do pcall(fn, new) end
   vim.schedule(function()
     vim.list_extend(lines, new)
     if #lines > MAX_LINES then

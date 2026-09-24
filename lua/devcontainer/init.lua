@@ -168,6 +168,7 @@ function M.up(opts)
   busy[root] = true
   emit("DevcontainerStarting", { local_folder = root })
 
+  local progress, unsubscribe
   async.run(function()
     local o = config.get(root)
     local configs = spec.list_configs(root)
@@ -204,6 +205,9 @@ function M.up(opts)
     local name = conf.name or vim.fs.basename(root)
     log.info(("%s %s (%s backend, progress: :Devcontainer log)"):format(
       opts.rebuild and "rebuilding" or "starting", name, backend_name))
+    progress = require("devcontainer.progress").start("devcontainer " .. name)
+    progress:report(opts.rebuild and "rebuilding" or "starting")
+    unsubscribe = log.subscribe(function(lines) progress:feed(lines) end)
 
     local res = backend.up({
       local_folder = root,
@@ -226,6 +230,7 @@ function M.up(opts)
       config = res.config,
       name = res.config.name or name,
     })
+    progress:report("probing the environment of " .. (session.remote_user or "the container user"))
     session:setup_env(res.config)
     -- one exec instead of one blocking `which` per server when the clients move in
     local bins = lsp.binaries(root)
@@ -237,15 +242,20 @@ function M.up(opts)
     vim.list_extend(bins, require("devcontainer.ports").RELAYS)
     session:prefetch(bins)
 
+    require("devcontainer.git").after_attach(session, o)
+
     -- lifecycle hooks (the devcontainer CLI runs these itself)
     for _, hook in ipairs(res.hooks or {}) do
       for _, argv in ipairs(spec.commands(res.config[hook])) do
         log.info("running " .. hook)
+        progress:report("running " .. hook)
         local r = async.system(session:exec_argv(argv), { text = true, stdout = stream, stderr = stream })
         if r.code ~= 0 then log.warn(("%s failed with exit code %d"):format(hook, r.code)) end
       end
     end
 
+    -- dotfiles after the create hooks, like the CLI (which installs them itself)
+    if res.created then require("devcontainer.git").install_dotfiles(session, o) end
     require("devcontainer.container").inspect(session)
     session.watch_files = spec.config_files(config_file, conf)
     store.set(root, "fingerprint", { file = config_file, hash = fingerprint })
@@ -263,6 +273,8 @@ function M.up(opts)
     end
   end, function(err)
     busy[root] = nil
+    if unsubscribe then unsubscribe() end
+    if progress then progress:finish(not err, err and "failed" or "attached") end
     if err then log.error("devcontainer: " .. tostring(err)) end
   end)
 end
@@ -374,6 +386,20 @@ function M.unforward(arg)
     if not ports.unforward(s, port, arg:find(":", 1, true) and host or nil) then
       log.warn(("port %d is not forwarded"):format(port))
     end
+  end, "Devcontainer")
+end
+
+--- Add a devcontainer configuration to the current project from a template.
+function M.init_config()
+  ensure_setup()
+  require("devcontainer.templates").init(start_path())
+end
+
+--- Find and open a file that exists only in the container (below `dir`, or a folder of `files.roots`).
+function M.files(dir)
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    require("devcontainer.picker").files(s, dir and vim.trim(dir) or nil)
   end, "Devcontainer")
 end
 

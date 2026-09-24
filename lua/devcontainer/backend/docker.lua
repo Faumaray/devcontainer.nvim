@@ -74,6 +74,8 @@ function M.run_args(ctx, conf, image, labels)
   local mount = conf.workspaceMount
     or ("type=bind,source=%s,target=%s"):format(ctx.local_folder, ctx.remote_folder)
   if mount ~= "" then vim.list_extend(args, { "--mount", mount }) end
+  local agent = ctx.options and require("devcontainer.git").agent_mount(ctx.options)
+  if agent then vim.list_extend(args, { "--mount", agent, "-e", "SSH_AUTH_SOCK=" .. require("devcontainer.git").AGENT_SOCK }) end
   for k, v in vim.spairs(conf.containerEnv or {}) do vim.list_extend(args, { "-e", k .. "=" .. tostring(v) }) end
   for _, m in ipairs(conf.mounts or {}) do
     if type(m) == "table" then
@@ -137,12 +139,13 @@ function M.up(ctx, opts)
     id = nil
   end
 
-  local hooks
+  local hooks, created
   local remote_folder = ctx.remote_folder
   if not id then
     if conf.initializeCommand then run_on_host(conf.initializeCommand, ctx.local_folder) end
     id = create(ctx, conf, build_image(ctx, conf, opts), labels)
     hooks = { "onCreateCommand", "updateContentCommand", "postCreateCommand", "postStartCommand" }
+    created = true
   else
     if state ~= "running" then
       log.info("starting container " .. id)
@@ -161,6 +164,7 @@ function M.up(ctx, opts)
     remote_user = merged.remoteUser or merged.containerUser,
     config = merged,
     hooks = hooks,
+    created = created,
   }
 end
 

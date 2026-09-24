@@ -13,6 +13,7 @@ local HOST = E .. "/host-proj"
 local REMOTE = E .. "/workspaces/proj"
 
 vim.fn.delete(E, "rf")
+vim.env.XDG_DATA_HOME, vim.env.XDG_STATE_HOME = E .. "/data", E .. "/state"
 vim.fn.mkdir(HOST .. "/.devcontainer", "p")
 vim.fn.mkdir(REMOTE, "p")
 vim.fn.mkdir(E .. "/bin", "p")
@@ -44,7 +45,7 @@ write(HOST .. "/.devcontainer/devcontainer.json", [[
   "image": "fake:latest",
   "workspaceFolder": "/tmp/dc-e2e/workspaces/proj",
   "postCreateCommand": "touch /tmp/dc-e2e/post-create-ran",
-  "remoteEnv": { "MY_VAR": "${containerWorkspaceFolder}/x", },
+  "remoteEnv": { "MY_VAR": "${containerWorkspaceFolder}/x", "HOME": "/tmp/dc-e2e/home" },
 }
 ]])
 write(HOST .. "/util.h", "#pragma once\nint helper(int x);\n")
@@ -77,7 +78,15 @@ local function wait(ms, fn)
   return vim.wait(ms, fn, 50)
 end
 
-require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker" })
+-- git conveniences: gitconfig copied, dotfiles installed when the container is created
+write(E .. "/host.gitconfig", "[user]\n\tname = e2e\n")
+vim.fn.mkdir(E .. "/home", "p")
+vim.fn.mkdir(E .. "/dotrepo", "p")
+write(E .. "/dotrepo/.e2erc", "x\n")
+vim.system({ "sh", "-c", 'cd "$1" && git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x', "sh", E .. "/dotrepo" }):wait()
+
+require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker",
+  git = { gitconfig = E .. "/host.gitconfig" }, dotfiles = { repository = E .. "/dotrepo" } })
 vim.lsp.config("clangd", {
   cmd = { "clangd", "--log=error" },
   filetypes = { "c", "cpp" },
@@ -96,12 +105,13 @@ vim.api.nvim_create_autocmd("User", {
   pattern = { "DevcontainerStarting", "DevcontainerAttached", "DevcontainerDetached" },
   callback = function(ev) table.insert(events, { ev.match, ev.data }) end,
 })
-local answers = {} -- kind -> answer for vim.ui.select
+local answers = {} -- kind -> answer (or fun(items) -> answer) for vim.ui.select
 local orig_select = vim.ui.select
 vim.ui.select = function(items, o, cb)
   local want = answers[o.kind or ""]
   if want == nil then return orig_select(items, o, cb) end
   answers[o.kind] = nil
+  if type(want) == "function" then want = want(items) end
   cb(want)
 end
 
@@ -124,6 +134,8 @@ check("remoteUser from image metadata", session.remote_user == "vscode", session
 check("remoteEnv substituted", session.env.MY_VAR == REMOTE .. "/x", session.env.MY_VAR)
 check("remoteEnv from metadata uses ${containerEnv}", session.env.FROM_META == vim.env.HOME .. "/meta", session.env.FROM_META)
 check("postCreateCommand ran", vim.uv.fs_stat(E .. "/post-create-ran") ~= nil)
+check("~/.gitconfig copied into the container", read(E .. "/home/.gitconfig") == "[user]\n\tname = e2e\n", read(E .. "/home/.gitconfig"))
+check("dotfiles cloned and linked", vim.uv.fs_readlink(E .. "/home/.e2erc") == E .. "/home/dotfiles/.e2erc")
 check("Starting and Attached events", wait(2000, function() return #events >= 2 end) and events[1][1] == "DevcontainerStarting"
   and events[2][1] == "DevcontainerAttached" and events[2][2].local_folder == HOST and events[2][2].key == session.key, events)
 check("published ports read from docker inspect", session.published and session.published[9999] == 19999, session.published)
@@ -349,6 +361,27 @@ end
 require("devcontainer.config").options.ports.relay = nil
 require("devcontainer.profiles").invalidate()
 echo:kill(9)
+
+-- 7e. :Devcontainer files (vim.ui.select picker) ---------------------------------------------------
+answers["devcontainer.files"] = function(items)
+  for _, p in ipairs(items) do
+    if p:match("note%.txt$") then return p end
+  end
+end
+vim.cmd("Devcontainer files " .. E .. "/container-only")
+check("files: container file opened as devcontainer://", vim.api.nvim_buf_get_name(0) == "devcontainer://" .. session.key .. E .. "/container-only/note.txt",
+  vim.api.nvim_buf_get_name(0))
+
+-- 7f. :Devcontainer init (no CLI: a minimal image config) -----------------------------------------
+vim.fn.mkdir(E .. "/newproj/.git", "p")
+answers["devcontainer.template"] = function(items) return items[1] end
+answers["devcontainer.start"] = "Later"
+require("devcontainer.templates").init(E .. "/newproj")
+local created
+check("init: devcontainer.json written and opened", wait(5000, function()
+  created = read(E .. "/newproj/.devcontainer/devcontainer.json")
+  return created ~= nil and vim.api.nvim_buf_get_name(0) == E .. "/newproj/.devcontainer/devcontainer.json"
+end) and created:find('"image": "mcr.microsoft.com/devcontainers/cpp:latest"', 1, true) ~= nil, created)
 
 -- 7b. :Devcontainer exec -----------------------------------------------------------------------
 vim.cmd.buffer(main_buf)

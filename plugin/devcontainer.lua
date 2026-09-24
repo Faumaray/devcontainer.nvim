@@ -10,6 +10,7 @@ local function targets(arglead) return require("devcontainer.project").complete_
 local subcommands = {
   -- container
   up = { fn = function() dc().up() end },
+  init = { fn = function() dc().init_config() end },
   rebuild = {
     fn = function(args) dc().rebuild({ no_cache = args:find("--no-cache", 1, true) ~= nil }) end,
     complete = function() return { "--no-cache" } end,
@@ -18,6 +19,7 @@ local subcommands = {
   down = { fn = function() dc().down() end },
   config = { fn = function() dc().open_config() end },
   ports = { fn = function() dc().ports() end },
+  files = { fn = function(args) dc().files(args) end },
   forward = {
     fn = function(args) dc().forward(args) end,
     complete = function()

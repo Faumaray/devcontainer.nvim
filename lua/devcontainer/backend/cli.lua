@@ -31,6 +31,10 @@ function M.up(ctx, opts)
   local args = vim.list_extend({ o.cli, "up" }, common)
   if opts.rebuild then table.insert(args, "--remove-existing-container") end
   if opts.no_cache then table.insert(args, "--build-no-cache") end
+  local git = require("devcontainer.git")
+  local agent = git.agent_mount(o)
+  if agent then vim.list_extend(args, { "--mount", agent }) end
+  vim.list_extend(args, git.cli_dotfiles_args(o))
   vim.list_extend(args, o.cli_up_args or {})
 
   local out = {}
