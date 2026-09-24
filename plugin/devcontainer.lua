@@ -20,6 +20,14 @@ local subcommands = {
   log = { fn = function() require("devcontainer.log").open() end },
   info = { fn = function() dc().info() end },
   forget = { fn = function() dc().forget() end },
+  profile = {
+    fn = function(args) dc().profile(args ~= "" and vim.trim(args) or nil) end,
+    complete = function()
+      local profiles = require("devcontainer.profiles")
+      local _, ws = profiles.current_scope()
+      return vim.list_extend({ "none" }, profiles.names(ws))
+    end,
+  },
   -- project (CMake / Cargo), in the container when attached
   configure = { fn = function(args) dc().configure(args) end },
   build = { fn = function(args) dc().build(args) end, complete = targets },

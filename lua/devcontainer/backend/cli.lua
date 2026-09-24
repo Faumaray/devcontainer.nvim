@@ -24,7 +24,7 @@ local function last_json(s)
 end
 
 function M.up(ctx, opts)
-  local o = require("devcontainer.config").options
+  local o = ctx.options or require("devcontainer.config").options
   local common = { "--workspace-folder", ctx.local_folder, "--config", ctx.config_file }
   if ctx.docker ~= "docker" then vim.list_extend(common, { "--docker-path", ctx.docker }) end
 

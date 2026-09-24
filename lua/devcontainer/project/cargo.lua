@@ -30,11 +30,14 @@ local function profile(ctx)
   return ctx.state.profile or ctx.opts.profile or "dev"
 end
 
+--- --release / --profile x, plus the configured features
 local function profile_args(ctx)
   local p = profile(ctx)
-  if p == "dev" then return {} end
-  if p == "release" then return { "--release" } end
-  return { "--profile", p }
+  local out = p == "release" and { "--release" } or p ~= "dev" and { "--profile", p } or {}
+  local features = ctx.opts.features or {}
+  if #features > 0 then vim.list_extend(out, { "--features", table.concat(features, ",") }) end
+  if ctx.opts.no_default_features then table.insert(out, "--no-default-features") end
+  return out
 end
 
 local function profile_dir(ctx)
@@ -170,12 +173,16 @@ M.actions = {
   {
     name = "check",
     desc = "cargo check --all-targets",
-    run = function(ctx, args) return { cargo(ctx, "check", vim.list_extend({ "--all-targets" }, args.extra)) } end,
+    run = function(ctx, args)
+      return { cargo(ctx, "check", vim.list_extend(vim.list_extend({ "--all-targets" }, profile_args(ctx)), args.extra)) }
+    end,
   },
   {
     name = "clippy",
     desc = "cargo clippy --all-targets",
-    run = function(ctx, args) return { cargo(ctx, "clippy", vim.list_extend({ "--all-targets" }, args.extra)) } end,
+    run = function(ctx, args)
+      return { cargo(ctx, "clippy", vim.list_extend(vim.list_extend({ "--all-targets" }, profile_args(ctx)), args.extra)) }
+    end,
   },
   { name = "fmt", desc = "cargo fmt", run = function(ctx, args) return { cargo(ctx, "fmt", args.extra) } end },
   { name = "doc", desc = "cargo doc", run = function(ctx, args) return { cargo(ctx, "doc", args.extra) } end },
@@ -207,7 +214,8 @@ function M.settings(ctx)
 end
 
 function M.describe(ctx)
-  return "profile " .. profile(ctx)
+  local features = ctx.opts.features or {}
+  return "cargo profile " .. profile(ctx) .. (#features > 0 and (", features " .. table.concat(features, ",")) or "")
 end
 
 return M

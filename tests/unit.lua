@@ -466,5 +466,104 @@ test("cargo: custom profiles from Cargo.toml", function()
   eq(cargo.profiles(tmp .. "/prof"), { "dev", "release", "ci", "fast" })
 end)
 
+-- profiles -------------------------------------------------------------------------------------
+
+local config = require("devcontainer.config")
+local profiles = require("devcontainer.profiles")
+
+test("config.merge: dicts merge, lists replace, *_args append in profile layers", function()
+  local base = { a = { x = 1, l = { 1, 2 } }, build_args = { "-j" }, s = "*" }
+  eq(config.merge(base, { a = { y = 2, l = { 3 } }, build_args = { "-v" }, s = { "clangd" } }),
+    { a = { x = 1, y = 2, l = { 3 } }, build_args = { "-v" }, s = { "clangd" } })
+  eq(config.merge(base, { build_args = { "-v" }, a = { l = {} } }, true), { a = { x = 1, l = {} }, build_args = { "-j", "-v" }, s = "*" })
+  eq(base.build_args, { "-j" }, "base untouched")
+end)
+
+vim.env.XDG_STATE_HOME = tmp .. "/state"
+vim.fn.mkdir(tmp .. "/state/nvim", "p")
+test("profiles: match, extends, customizations, selection", function()
+  local ws = tmp .. "/prof-ws"
+  local file = ws .. "/.devcontainer/devcontainer.json"
+  writef(file, vim.json.encode({
+    image = "x",
+    customizations = { ["devcontainer.nvim"] = {
+      profile = "team",
+      settings = { docker = "/tmp/evil", project = { cmake = { generator = "Ninja" }, debug = { command = { "rm" }, adapter = "lldb" } } },
+      profiles = { team = { desc = "shared", cli = "/tmp/evil", project = { cmake = { configure_args = { "-DTEAM=1" } } } } },
+    } },
+  }))
+  config.set({ profiles = {
+    base = { project = { cmake = { configure_args = { "-DBASE=1" } } } },
+    asan = { desc = "ASan", extends = "base", project = { cmake = { configure_args = { "-DASAN=1" }, build_type = "RelWithDebInfo" } } },
+    work = { match = ws, project = { env = { WORK = "1" } } },
+  } })
+  -- untrusted: customizations ignored
+  local o = config.get(ws)
+  eq(o.project.env, { WORK = "1" }, "folder profile applied")
+  eq(o.project.cmake.generator, nil, "untrusted customizations ignored")
+  eq(profiles.describe(ws).matched, { "work" })
+
+  vim.cmd.edit(file)
+  vim.secure.trust({ action = "allow", bufnr = 0 })
+  vim.cmd.bwipeout()
+  profiles.invalidate()
+  o = config.get(ws)
+  eq(o.project.cmake.generator, "Ninja", "trusted customization settings")
+  eq(o.docker, config.options.docker, "docker path can't come from the repository")
+  eq(o.project.debug.command, config.options.project.debug.command, "debug command can't come from the repository")
+  eq(o.project.debug.adapter, "lldb")
+  eq(profiles.describe(ws).selected, "team", "devcontainer.json default profile")
+  eq(o.project.cmake.configure_args, { "-DTEAM=1" })
+  eq(o.cli, config.options.cli)
+
+  profiles.set(ws, "asan")
+  o = config.get(ws)
+  eq(o.project.cmake.configure_args, { "-DBASE=1", "-DASAN=1" }, "extends chain, _args appended")
+  eq(o.project.cmake.build_type, "RelWithDebInfo")
+  eq(o.project.env, { WORK = "1" })
+  eq(profiles.active_name(ws), "asan")
+  eq(config.get(ws .. "/sub").project.cmake.build_type, "RelWithDebInfo", "subfolder uses the workspace selection")
+
+  profiles.set(ws, "none")
+  eq(profiles.describe(ws).selected, nil)
+  eq(config.get(ws).project.cmake.configure_args, {})
+  profiles.set(ws, nil)
+  eq(profiles.describe(ws).selected, "team")
+
+  eq(profiles.matches({ "~/nope", function(r) return r == "/x" end }, { "/x" }), true)
+  eq(profiles.matches(tmp .. "/*", { tmp .. "/a" }), true)
+  eq(profiles.matches(tmp .. "/*", { tmp .. "/a/b" }), false)
+  eq(profiles.matches(tmp, { tmp .. "/a/b" }), true, "plain folder matches below it")
+  config.set({})
+end)
+
+test("cmake: ${profile} macro and reconfigure when the configure settings change", function()
+  local root = tmp .. "/recfg"
+  writef(root .. "/CMakeLists.txt", "")
+  local opts = vim.deepcopy(config.options.project.cmake)
+  opts.build_dir = "build/${profile}-${buildType}"
+  local ctx = setmetatable({ root = root, provider = cmake, state = {}, opts = opts, profile = "asan",
+    options = config.options }, { __index = {
+      exec_path = function(_, x) return x end, task = function(_, t) t.cwd = root; return t end,
+    } })
+  local r = cmake.resolve(ctx)
+  eq(r.build_arg, "build/asan-Debug")
+  writef(r.host_build .. "/CMakeCache.txt", "")
+  local build = cmake.actions[2]
+  eq(#build.run(ctx, { extra = {} }), 1, "configured, nothing stored: just build")
+  cmake.after(ctx, "configure")
+  eq(#build.run(ctx, { extra = {} }), 1, "same settings: just build")
+  opts.configure_args = { "-DNEW=1" }
+  local steps = build.run(ctx, { extra = {} })
+  eq(steps[#steps - 1].cmd[#steps[#steps - 1].cmd], "-DNEW=1", "reconfigure before building")
+end)
+
+test("cargo: features and custom profile flags", function()
+  local ctx = setmetatable({ root = "/r", provider = cargo, state = {}, opts = { profile = "ci", features = { "a", "b" },
+    no_default_features = true, build_args = {}, test_args = {} } }, { __index = { task = function(_, t) return t end } })
+  eq(cargo.actions[2].run(ctx, { extra = {} })[1].cmd, { "cargo", "build", "--profile", "ci", "--features", "a,b", "--no-default-features" })
+  eq(cargo.actions[4].run(ctx, { extra = {} })[1].cmd, { "cargo", "test", "--profile", "ci", "--features", "a,b", "--no-default-features" })
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

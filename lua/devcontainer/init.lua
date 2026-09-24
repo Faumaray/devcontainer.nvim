@@ -19,6 +19,15 @@ function M.setup(opts)
 
   local group = vim.api.nvim_create_augroup("devcontainer", { clear = true })
   require("devcontainer.autostart").setup(group)
+  -- customizations["devcontainer.nvim"] / workspace detection may have changed
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = group,
+    pattern = { "devcontainer.json", ".devcontainer.json" },
+    callback = function()
+      spec.clear_cache()
+      require("devcontainer.profiles").invalidate()
+    end,
+  })
   if config.options.stop_on_exit then
     vim.api.nvim_create_autocmd("VimLeavePre", {
       group = group,
@@ -40,10 +49,27 @@ local function ensure_setup()
   if not did_setup then M.setup({}) end
 end
 
-local function pick_backend()
-  local b = config.options.backend
-  if b == "auto" then b = vim.fn.executable(config.options.cli) == 1 and "cli" or "docker" end
+local function pick_backend(o)
+  local b = o.backend
+  if b == "auto" then b = vim.fn.executable(o.cli) == 1 and "cli" or "docker" end
   return b, require("devcontainer.backend." .. b)
+end
+
+--- The config file to use: the one named by the `devcontainer` option (a profile), the only one,
+--- or ask. Runs inside async.run.
+local function choose_config(root, configs, wanted)
+  if wanted then
+    for _, p in ipairs(configs) do
+      local rel = p:sub(#root + 2)
+      if rel == wanted or vim.fs.basename(vim.fs.dirname(p)) == wanted then return p end
+    end
+    log.warn(("devcontainer config %q not found in %s"):format(wanted, root))
+  end
+  if #configs == 1 then return configs[1] end
+  return async.select(configs, {
+    prompt = "Devcontainer configuration",
+    format_item = function(p) return p:sub(#root + 2) end,
+  })
 end
 
 local function stream(_, data) log.append(data) end
@@ -90,16 +116,11 @@ function M.up(opts)
   busy[root] = true
 
   async.run(function()
+    local o = config.get(root)
     local configs = spec.list_configs(root)
     if #configs == 0 then error("no devcontainer.json in " .. root, 0) end
-    local config_file = configs[1]
-    if #configs > 1 then
-      config_file = async.select(configs, {
-        prompt = "Devcontainer configuration",
-        format_item = function(p) return p:sub(#root + 2) end,
-      })
-      if not config_file then return end
-    end
+    local config_file = choose_config(root, configs, o.devcontainer)
+    if not config_file then return end
     local conf, remote_folder, explicit = spec.load(config_file, root)
     if not conf then error(remote_folder, 0) end
 
@@ -113,7 +134,7 @@ function M.up(opts)
       M._teardown(existing)
     end
 
-    local backend_name, backend = pick_backend()
+    local backend_name, backend = pick_backend(o)
     local name = conf.name or vim.fs.basename(root)
     log.info(("%s %s (%s backend, progress: :Devcontainer log)"):format(
       opts.rebuild and "rebuilding" or "starting", name, backend_name))
@@ -124,7 +145,8 @@ function M.up(opts)
       config = conf,
       remote_folder = remote_folder,
       explicit_remote_folder = explicit,
-      docker = config.options.docker,
+      docker = o.docker,
+      options = o,
     }, { rebuild = opts.rebuild, no_cache = opts.no_cache })
 
     local session = registry.new({
@@ -132,7 +154,7 @@ function M.up(opts)
       local_folder = root,
       remote_folder = res.remote_folder,
       remote_user = res.remote_user,
-      docker = config.options.docker,
+      docker = o.docker,
       backend = backend_name,
       config_file = config_file,
       config = res.config,
@@ -145,7 +167,7 @@ function M.up(opts)
       local cmd = lsp.host_cmd(e.config)
       if type(cmd) == "table" and type(cmd[1]) == "string" then vim.list_extend(bins, { cmd[1], vim.fs.basename(cmd[1]) }) end
     end
-    table.insert(bins, config.options.project.debug.command[1])
+    table.insert(bins, o.project.debug.command[1])
     session:prefetch(bins)
 
     -- lifecycle hooks (the devcontainer CLI runs these itself)
@@ -231,20 +253,102 @@ function M.info()
     local root = spec.find_root(start_path())
     lines = { root and ("not attached; :Devcontainer up to start " .. root) or "no devcontainer config in this workspace" }
   end
+  local profiles = require("devcontainer.profiles")
+  local p = profiles.describe((profiles.current_scope()))
+  if p.selected or #p.matched > 0 then
+    table.insert(lines, ("profile: %s%s"):format(p.selected or "none",
+      #p.matched > 0 and (" (matched: " .. table.concat(p.matched, ", ") .. ")") or ""))
+  end
   if project then table.insert(lines, project) end
   vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "devcontainer" })
 end
 
---- Name of the devcontainer the current buffer belongs to ("" if none), for statuslines.
-function M.statusline()
+--- Name of the devcontainer the current buffer belongs to ("" if none), for statuslines:
+--- "name", "name [profile]" when a profile is selected, "name (starting)" while it starts.
+---@param opts? { profile?: boolean }
+function M.statusline(opts)
   local s = registry.current()
-  if s then return s.name end
+  if s then
+    local profile = not (opts and opts.profile == false) and require("devcontainer.profiles").active_name(s.local_folder)
+    return profile and ("%s [%s]"):format(s.name, profile) or s.name
+  end
   if next(busy) == nil then return "" end
   local path = vim.api.nvim_buf_get_name(0)
   if path == "" or path:match("^%a[%w+.-]*://") then path = vim.fn.getcwd() end
   local root = spec.find_root_cached(path)
   if root and busy[root] then return vim.fs.basename(root) .. " (starting)" end
   return ""
+end
+
+--- Select the profile of the current workspace: a name, "none", or nil to pick one.
+---@param name? string
+function M.profile(name)
+  ensure_setup()
+  local profiles = require("devcontainer.profiles")
+  local scope, ws = profiles.current_scope()
+  local defs = profiles.definitions(ws)
+
+  local function apply(choice)
+    local before = config.get(scope)
+    profiles.set(scope, choice)
+    local after = config.get(scope)
+    -- manual choices (:Devcontainer select) would hide what the profile sets
+    local ctx = require("devcontainer.project").detect()
+    if ctx then
+      for _, k in ipairs({ "preset", "build_type", "profile" }) do
+        if ctx.state[k] ~= nil then ctx:set(k, nil) end
+      end
+    end
+    log.info(("profile for %s: %s"):format(vim.fn.fnamemodify(scope, ":~"), choice or "default"))
+    local s = registry.by_folder(scope)
+    if s then
+      if not vim.deep_equal(before.lsp, after.lsp) then require("devcontainer.lsp").restart(s.local_folder) end
+      for _, k in ipairs({ "devcontainer", "backend", "docker", "cli_up_args", "git", "dotfiles" }) do
+        if not vim.deep_equal(before[k], after[k]) then
+          log.warn("the profile changes container settings: run :Devcontainer rebuild to apply them")
+          break
+        end
+      end
+    end
+    vim.api.nvim_exec_autocmds("User", {
+      pattern = "DevcontainerProfileChanged",
+      modeline = false,
+      data = { scope = scope, profile = profiles.describe(scope).selected },
+    })
+    vim.cmd.redrawstatus({ bang = true })
+  end
+
+  if name then
+    if name ~= "none" and not defs[name] then return log.warn("unknown profile " .. name) end
+    return apply(name)
+  end
+  local info = profiles.describe(scope)
+  local items = { { name = "none", desc = "no profile" } }
+  for _, n in ipairs(profiles.names(ws)) do
+    table.insert(items, { name = n, desc = defs[n].desc })
+  end
+  vim.ui.select(items, {
+    prompt = "Profile for " .. vim.fn.fnamemodify(scope, ":~"),
+    format_item = function(it)
+      local mark = (it.name == info.selected or (it.name == "none" and not info.selected)) and "● " or "  "
+      local auto = vim.tbl_contains(info.matched, it.name) and " (auto)" or ""
+      return ("%s%s%s%s"):format(mark, it.name, auto, it.desc and ("  — " .. it.desc) or "")
+    end,
+  }, function(choice)
+    if choice then apply(choice.name) end
+  end)
+end
+
+--- Options that apply to `path` (default: the current workspace), profiles included.
+---@param path? string
+---@return devcontainer.Options
+function M.options(path)
+  return config.get(path or require("devcontainer.profiles").current_scope())
+end
+
+--- Define profiles at runtime, e.g. from a project's .nvim.lua (:help 'exrc').
+function M.add_profiles(defs)
+  require("devcontainer.profiles").add(defs)
 end
 
 --- Forget the remembered autostart answer for the current project.

@@ -11,12 +11,13 @@ local M = {}
 
 local helpers = setmetatable({}, { __mode = "k" }) -- cmd functions created by M.cmd() -> argv
 
-local function opts()
-  return config.options.lsp
+--- LSP options for a workspace root (profiles applied), or the global ones.
+local function opts(root)
+  return config.get(root).lsp
 end
 
-function M.managed(name)
-  local o = opts()
+function M.managed(name, root)
+  local o = opts(root)
   if not o.enabled or not name then return false end
   if vim.tbl_contains(o.exclude or {}, name) then return false end
   return o.servers == "*" or vim.tbl_contains(o.servers or {}, name)
@@ -47,7 +48,7 @@ end
 
 --- argv to run inside the container, or nil when the server isn't installed there.
 local function remote_argv(session, name, host_cmd)
-  local override = opts().remote_cmd[name]
+  local override = opts(session.local_folder).remote_cmd[name]
   if type(override) == "function" then override = override(host_cmd, session) end
   if type(override) == "table" then return override end
 
@@ -130,10 +131,17 @@ end
 function M.rewrite(cfg)
   local host_cmd = host_cmd_of(cfg)
   local name = cfg.name or (type(host_cmd) == "table" and vim.fs.basename(host_cmd[1])) or nil
-  if not host_cmd or not M.managed(name) then return cfg end
-
   local root = M.root_of(cfg)
   local session = root and registry.find(root)
+  if not host_cmd then return cfg end
+  if not M.managed(name, session and session.local_folder) then
+    if not cfg._devcontainer_host_cmd then return cfg end
+    -- was running in a container, now excluded (profile change): back to the host command
+    local host = vim.tbl_extend("force", {}, cfg, { cmd = host_cmd })
+    host._devcontainer_host_cmd, host._devcontainer_key = nil, nil
+    return host
+  end
+
   local new = vim.tbl_extend("force", {}, cfg)
   new.name = name
   new._devcontainer_host_cmd = host_cmd
@@ -146,7 +154,7 @@ function M.rewrite(cfg)
 
   local argv = remote_argv(session, name, host_cmd)
   if not argv then
-    local fallback = opts().fallback
+    local fallback = opts(session.local_folder).fallback
     if not session.warned[name] then
       session.warned[name] = true
       log.warn(("%s not found in container %s — %s"):format(
