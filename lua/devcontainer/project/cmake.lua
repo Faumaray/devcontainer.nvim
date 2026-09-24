@@ -3,6 +3,7 @@
 local async = require("devcontainer.async")
 local jsonc = require("devcontainer.jsonc")
 local runner = require("devcontainer.runner")
+local store = require("devcontainer.store")
 
 local M = { name = "cmake" }
 
@@ -120,9 +121,10 @@ end
 function M.resolve(ctx)
   local o = ctx.opts
   local presets = M.presets(ctx.root)
-  local r = { presets = presets }
+  local r = { presets = presets, profile = ctx.profile }
+  local profile = ctx.profile or "default"
   if presets and #presets.order > 0 then
-    local name = ctx.state.preset
+    local name = ctx.state.preset or o.preset
     if not presets.configure[name] then name = presets.order[1] end
     local p = presets.configure[name]
     r.preset = name
@@ -145,12 +147,12 @@ function M.resolve(ctx)
       if tp.configurePreset == name and (not r.test_preset or tname == ctx.state.test_preset) then r.test_preset = tname end
     end
     if not r.host_build then
-      r.build_arg = M.expand(o.build_dir, { buildType = r.build_type or name, presetName = name })
+      r.build_arg = M.expand(o.build_dir, { buildType = r.build_type or name, presetName = name, profile = profile })
       r.host_build = vim.fs.normalize(ctx.root .. "/" .. r.build_arg)
     end
   else
     r.build_type = ctx.state.build_type or o.build_type
-    r.build_arg = M.expand(o.build_dir, { buildType = r.build_type, presetName = r.build_type })
+    r.build_arg = M.expand(o.build_dir, { buildType = r.build_type, presetName = r.build_type, profile = profile })
     r.host_build = vim.fs.normalize(r.build_arg:sub(1, 1) == "/" and r.build_arg or (ctx.root .. "/" .. r.build_arg))
   end
   -- how to refer to the build dir on the command line (cwd = project root)
@@ -163,6 +165,29 @@ end
 
 local function configured(r)
   return r.host_build and vim.uv.fs_stat(r.host_build .. "/CMakeCache.txt") ~= nil
+end
+
+--- What decides how a build dir is configured (preset / build type / configure args / env).
+--- Stored after a successful configure; a change (another profile, say) triggers a reconfigure.
+function M.configure_key(ctx, r)
+  local parts = { r.preset or "", r.build_type or "", r.build_arg, "args" }
+  vim.list_extend(parts, ctx.opts.configure_args or {})
+  table.insert(parts, "env")
+  for k, v in vim.spairs(ctx.options and ctx.options.project.env or {}) do
+    table.insert(parts, k .. "=" .. tostring(v))
+  end
+  return vim.fn.sha256(table.concat(parts, "\31")):sub(1, 16)
+end
+
+local function build_id(r)
+  return vim.fn.sha256(r.host_build):sub(1, 16)
+end
+
+--- Configured, but with different settings than the current ones?
+local function stale(ctx, r)
+  local stored = store.get(ctx.root).cmake_configured
+  local old = stored and stored[build_id(r)]
+  return old ~= nil and old ~= M.configure_key(ctx, r)
 end
 
 -- File API -----------------------------------------------------------------------------------
@@ -254,7 +279,7 @@ local function spec(ctx, r, t)
 end
 
 local function label(r)
-  return r.preset or r.build_type or "default"
+  return (r.preset or r.build_type or "default") .. (r.profile and (", " .. r.profile) or "")
 end
 
 local function configure_step(ctx, r, extra, fresh)
@@ -295,7 +320,7 @@ end
 --- configure (when needed) + build steps
 local function build_steps(ctx, r, target, extra, template)
   local steps = {}
-  if not template and not configured(r) then steps = configure_step(ctx, r) end
+  if not template and (not configured(r) or stale(ctx, r)) then steps = configure_step(ctx, r) end
   table.insert(steps, spec(ctx, r, {
     name = ("cmake build%s (%s)"):format(target and (" " .. target) or "", label(r)),
     cmd = build_cmd(ctx, r, target, extra),
@@ -324,7 +349,7 @@ M.actions = {
     interactive = true,
     run = function(ctx, args)
       local r = M.resolve(ctx)
-      local steps = configured(r) and {} or configure_step(ctx, r)
+      local steps = (configured(r) and not stale(ctx, r)) and {} or configure_step(ctx, r)
       table.insert(steps, function(cb)
         async.run(function()
           local exe = require("devcontainer.project").pick_executable(ctx, args.target)
@@ -376,10 +401,12 @@ M.actions = {
   },
 }
 
---- After configure: link compile_commands.json into the project root for clangd.
+--- After configure: remember the configuration, link compile_commands.json for clangd.
 function M.after(ctx, action)
-  if action ~= "configure" or not ctx.opts.link_compile_commands then return end
+  if action ~= "configure" then return end
   local r = M.resolve(ctx)
+  if r.host_build then store.set(ctx.root, "cmake_configured." .. build_id(r), M.configure_key(ctx, r)) end
+  if not ctx.opts.link_compile_commands then return end
   local db = r.host_build and (r.host_build .. "/compile_commands.json")
   if not db or not vim.uv.fs_stat(db) or not vim.startswith(r.host_build, ctx.root .. "/") then return end
   local link = ctx.root .. "/compile_commands.json"
@@ -425,7 +452,7 @@ end
 function M.describe(ctx)
   local r = M.resolve(ctx)
   return (r.preset and ("preset " .. r.preset) or ("build type " .. r.build_type))
-    .. (configured(r) and "" or ", not configured")
+    .. (not configured(r) and ", not configured" or stale(ctx, r) and ", needs reconfigure" or "")
 end
 
 return M

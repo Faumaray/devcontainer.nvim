@@ -17,6 +17,34 @@ local function detect_filetype(buf, path)
   return ft
 end
 
+-- One exec: a flag byte, then the payload. D = directory listing, N = new file,
+-- W / R = contents of a writable / read-only file.
+local READ_SCRIPT = [[
+if [ -d "$1" ]; then printf D; ls -1Ap -- "$1"
+elif [ ! -e "$1" ]; then printf N
+elif [ -w "$1" ]; then printf W; cat -- "$1"
+else printf R; cat -- "$1"; fi]]
+
+--- Minimal directory browser: <CR> opens the entry under the cursor, `-` goes to the parent.
+local function show_dir(buf, key, path, listing)
+  local dir = path:gsub("/+$", "")
+  local base = "devcontainer://" .. key .. dir
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(listing, "\n", { plain = true, trimempty = true }))
+  vim.bo[buf].modifiable = false
+  vim.bo[buf].modified = false
+  vim.bo[buf].filetype = "devcontainer_dir"
+  vim.keymap.set("n", "<CR>", function()
+    local entry = vim.api.nvim_get_current_line()
+    if entry ~= "" then vim.cmd.edit(vim.fn.fnameescape(base .. "/" .. entry)) end
+  end, { buffer = buf, desc = "Open the entry under the cursor" })
+  vim.keymap.set("n", "-", function()
+    local parent = dir == "" and "/" or vim.fs.dirname(dir)
+    vim.cmd.edit(vim.fn.fnameescape(("devcontainer://%s%s"):format(key, parent == "/" and "/" or (parent .. "/"))))
+  end, { buffer = buf, desc = "Open the parent directory" })
+end
+
 local function read(ev)
   local buf = ev.buf
   local name = vim.api.nvim_buf_get_name(buf)
@@ -25,16 +53,23 @@ local function read(ev)
   vim.bo[buf].buftype = "acwrite"
   vim.bo[buf].swapfile = false
   if not session then
+    -- e.g. restored by a session manager before the container is attached: read it again then
+    vim.b[buf].devcontainer_unread = true
     log.warn("no attached devcontainer for " .. name)
     return
   end
+  vim.b[buf].devcontainer_unread = nil
 
-  local res = vim.system(session:exec_argv({ "cat", "--", path }, { env = false }), {}):wait(20000)
-  if res.code ~= 0 then
+  local res = vim.system(session:exec_argv({ "/bin/sh", "-c", READ_SCRIPT, "sh", path }, { env = false }), {}):wait(20000)
+  local out = res.stdout or ""
+  local flag = out:sub(1, 1)
+  if res.code ~= 0 or flag == "" then
     log.error(("cannot read %s in %s: %s"):format(path, session.name, vim.trim(res.stderr or "")))
     return
   end
-  local data = res.stdout or ""
+  if flag == "D" then return show_dir(buf, key, path, out:sub(2)) end
+
+  local data = out:sub(2)
   local eol = data:sub(-1) == "\n"
   if eol then data = data:sub(1, -2) end
   local lines = vim.split(data, "\n", { plain = true })
@@ -49,6 +84,7 @@ local function read(ev)
   vim.bo[buf].undolevels = undolevels
   vim.bo[buf].eol = eol or data == ""
   vim.bo[buf].modified = false
+  vim.bo[buf].readonly = flag == "R"
 
   local ft = detect_filetype(buf, path)
   if ft and vim.bo[buf].filetype ~= ft then vim.bo[buf].filetype = ft end

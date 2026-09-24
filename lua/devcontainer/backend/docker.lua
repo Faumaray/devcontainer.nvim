@@ -45,7 +45,7 @@ local function run_on_host(cmd, cwd)
   end
 end
 
-local function build_image(ctx, conf)
+local function build_image(ctx, conf, opts)
   local build = type(conf.build) == "table" and conf.build or {}
   local dockerfile = build.dockerfile or conf.dockerFile
   if not dockerfile then
@@ -57,6 +57,7 @@ local function build_image(ctx, conf)
   local slug = (vim.fs.basename(ctx.local_folder):lower():gsub("[^%w_.-]", "-"))
   local tag = ("nvim-devcontainer-%s-%s"):format(slug, vim.fn.sha256(ctx.config_file):sub(1, 8))
   local args = { ctx.docker, "build", "-f", rel(dockerfile), "-t", tag }
+  if opts.no_cache then table.insert(args, "--no-cache") end
   for k, v in vim.spairs(build.args or {}) do vim.list_extend(args, { "--build-arg", k .. "=" .. tostring(v) }) end
   if build.target then vim.list_extend(args, { "--target", build.target }) end
   vim.list_extend(args, build.options or {})
@@ -67,11 +68,14 @@ local function build_image(ctx, conf)
   return tag
 end
 
-local function create(ctx, conf, image, labels)
+--- `docker run` argv for a new container (pure, for tests).
+function M.run_args(ctx, conf, image, labels)
   local args = { ctx.docker, "run", "-d", "--label", labels[1], "--label", labels[2] }
   local mount = conf.workspaceMount
     or ("type=bind,source=%s,target=%s"):format(ctx.local_folder, ctx.remote_folder)
   if mount ~= "" then vim.list_extend(args, { "--mount", mount }) end
+  local agent = ctx.options and require("devcontainer.git").agent_mount(ctx.options)
+  if agent then vim.list_extend(args, { "--mount", agent, "-e", "SSH_AUTH_SOCK=" .. require("devcontainer.git").AGENT_SOCK }) end
   for k, v in vim.spairs(conf.containerEnv or {}) do vim.list_extend(args, { "-e", k .. "=" .. tostring(v) }) end
   for _, m in ipairs(conf.mounts or {}) do
     if type(m) == "table" then
@@ -79,8 +83,14 @@ local function create(ctx, conf, image, labels)
     end
     vim.list_extend(args, { "--mount", m })
   end
-  for _, port in ipairs(conf.forwardPorts or {}) do
-    if type(port) == "number" then vim.list_extend(args, { "-p", ("127.0.0.1:%d:%d"):format(port, port) }) end
+  -- appPort is published; forwardPorts are tunnelled after attach (devcontainer.ports)
+  local app = conf.appPort
+  for _, port in ipairs(type(app) == "table" and app or app and { app } or {}) do
+    if type(port) == "number" then
+      vim.list_extend(args, { "-p", ("127.0.0.1:%d:%d"):format(port, port) })
+    elseif type(port) == "string" then
+      vim.list_extend(args, { "-p", port })
+    end
   end
   if conf.containerUser then vim.list_extend(args, { "-u", conf.containerUser }) end
   if conf.privileged then table.insert(args, "--privileged") end
@@ -96,6 +106,11 @@ local function create(ctx, conf, image, labels)
   else
     table.insert(args, image)
   end
+  return args
+end
+
+local function create(ctx, conf, image, labels)
+  local args = M.run_args(ctx, conf, image, labels)
   log.info("creating container from " .. image)
   local res = async.check(args, { text = true })
   return vim.trim(res.stdout)
@@ -124,12 +139,13 @@ function M.up(ctx, opts)
     id = nil
   end
 
-  local hooks
+  local hooks, created
   local remote_folder = ctx.remote_folder
   if not id then
     if conf.initializeCommand then run_on_host(conf.initializeCommand, ctx.local_folder) end
-    id = create(ctx, conf, build_image(ctx, conf), labels)
+    id = create(ctx, conf, build_image(ctx, conf, opts), labels)
     hooks = { "onCreateCommand", "updateContentCommand", "postCreateCommand", "postStartCommand" }
+    created = true
   else
     if state ~= "running" then
       log.info("starting container " .. id)
@@ -148,6 +164,7 @@ function M.up(ctx, opts)
     remote_user = merged.remoteUser or merged.containerUser,
     config = merged,
     hooks = hooks,
+    created = created,
   }
 end
 

@@ -13,6 +13,7 @@ local HOST = E .. "/host-proj"
 local REMOTE = E .. "/workspaces/proj"
 
 vim.fn.delete(E, "rf")
+vim.env.XDG_DATA_HOME, vim.env.XDG_STATE_HOME = E .. "/data", E .. "/state"
 vim.fn.mkdir(HOST .. "/.devcontainer", "p")
 vim.fn.mkdir(REMOTE, "p")
 vim.fn.mkdir(E .. "/bin", "p")
@@ -44,7 +45,7 @@ write(HOST .. "/.devcontainer/devcontainer.json", [[
   "image": "fake:latest",
   "workspaceFolder": "/tmp/dc-e2e/workspaces/proj",
   "postCreateCommand": "touch /tmp/dc-e2e/post-create-ran",
-  "remoteEnv": { "MY_VAR": "${containerWorkspaceFolder}/x", },
+  "remoteEnv": { "MY_VAR": "${containerWorkspaceFolder}/x", "HOME": "/tmp/dc-e2e/home" },
 }
 ]])
 write(HOST .. "/util.h", "#pragma once\nint helper(int x);\n")
@@ -77,7 +78,15 @@ local function wait(ms, fn)
   return vim.wait(ms, fn, 50)
 end
 
-require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker" })
+-- git conveniences: gitconfig copied, dotfiles installed when the container is created
+write(E .. "/host.gitconfig", "[user]\n\tname = e2e\n")
+vim.fn.mkdir(E .. "/home", "p")
+vim.fn.mkdir(E .. "/dotrepo", "p")
+write(E .. "/dotrepo/.e2erc", "x\n")
+vim.system({ "sh", "-c", 'cd "$1" && git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x', "sh", E .. "/dotrepo" }):wait()
+
+require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker",
+  git = { gitconfig = E .. "/host.gitconfig" }, dotfiles = { repository = E .. "/dotrepo" } })
 vim.lsp.config("clangd", {
   cmd = { "clangd", "--log=error" },
   filetypes = { "c", "cpp" },
@@ -91,6 +100,28 @@ local main_buf = vim.api.nvim_get_current_buf()
 check("host clangd attached", wait(10000, function() return #vim.lsp.get_clients({ bufnr = main_buf }) == 1 end))
 check("host client is not in a container", vim.lsp.get_clients({ bufnr = main_buf })[1].config._devcontainer_key == nil)
 
+local events = {}
+vim.api.nvim_create_autocmd("User", {
+  pattern = { "DevcontainerStarting", "DevcontainerAttached", "DevcontainerDetached" },
+  callback = function(ev) table.insert(events, { ev.match, ev.data }) end,
+})
+local answers = {} -- kind -> answer (or fun(items) -> answer) for vim.ui.select
+local orig_select = vim.ui.select
+vim.ui.select = function(items, o, cb)
+  local want = answers[o.kind or ""]
+  if want == nil then return orig_select(items, o, cb) end
+  answers[o.kind] = nil
+  if type(want) == "function" then want = want(items) end
+  cb(want)
+end
+
+-- a devcontainer:// buffer restored (by a session manager) before the container runs
+local restored = "devcontainer://fc0123456789" .. E .. "/container-only/note.txt"
+vim.cmd.edit(restored)
+local restored_buf = vim.api.nvim_get_current_buf()
+check("restored buffer waits for the container", vim.b[restored_buf].devcontainer_unread == true)
+vim.cmd.buffer(main_buf)
+
 -- 2. :Devcontainer up ------------------------------------------------------------------------
 vim.cmd("Devcontainer up")
 local session
@@ -103,6 +134,14 @@ check("remoteUser from image metadata", session.remote_user == "vscode", session
 check("remoteEnv substituted", session.env.MY_VAR == REMOTE .. "/x", session.env.MY_VAR)
 check("remoteEnv from metadata uses ${containerEnv}", session.env.FROM_META == vim.env.HOME .. "/meta", session.env.FROM_META)
 check("postCreateCommand ran", vim.uv.fs_stat(E .. "/post-create-ran") ~= nil)
+check("~/.gitconfig copied into the container", read(E .. "/home/.gitconfig") == "[user]\n\tname = e2e\n", read(E .. "/home/.gitconfig"))
+check("dotfiles cloned and linked", vim.uv.fs_readlink(E .. "/home/.e2erc") == E .. "/home/dotfiles/.e2erc")
+check("Starting and Attached events", wait(2000, function() return #events >= 2 end) and events[1][1] == "DevcontainerStarting"
+  and events[2][1] == "DevcontainerAttached" and events[2][2].local_folder == HOST and events[2][2].key == session.key, events)
+check("published ports read from docker inspect", session.published and session.published[9999] == 19999, session.published)
+check("restored devcontainer:// buffer read after attach", wait(2000, function()
+  return vim.api.nvim_buf_get_lines(restored_buf, 0, -1, false)[1] == "old" and not vim.b[restored_buf].devcontainer_unread
+end), vim.api.nvim_buf_get_lines(restored_buf, 0, -1, false))
 
 local client
 check("clangd restarted inside the container", wait(15000, function()
@@ -113,6 +152,8 @@ check("only one clangd attached", #vim.lsp.get_clients({ bufnr = main_buf }) == 
 local docker_log = read(E .. "/docker.log") or ""
 check("server spawned through docker exec -i", docker_log:find('"exec", "-i", "-u", "vscode"', 1, true)
   and docker_log:find("clangd", 1, true) ~= nil)
+check("server binary looked up by the prefetch, not one exec per server",
+  docker_log:find("for b; do", 1, true) ~= nil and docker_log:find('"sh", "clangd"]', 1, true) == nil)
 
 -- 3. diagnostics come back with host URIs ----------------------------------------------------
 check("diagnostics on host buffer", wait(15000, function()
@@ -164,6 +205,19 @@ vim.api.nvim_buf_set_lines(0, 0, -1, false, { "new", "content" })
 vim.cmd("silent write")
 check("remote file written", read(E .. "/container-only/note.txt") == "new\ncontent\n", read(E .. "/container-only/note.txt"))
 check("buffer not modified after write", not vim.bo.modified)
+
+vim.cmd.edit(prefix .. E .. "/container-only/")
+local listing = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+check("remote directory listed", vim.tbl_contains(listing, "note.txt") and vim.bo.filetype == "devcontainer_dir", listing)
+for i, l in ipairs(listing) do
+  if l == "note.txt" then vim.api.nvim_win_set_cursor(0, { i, 0 }) end
+end
+vim.cmd.normal(vim.keycode("<CR>"))
+check("<CR> in a listing opens the file", vim.api.nvim_buf_get_name(0) == prefix .. E .. "/container-only/note.txt", vim.api.nvim_buf_get_name(0))
+vim.cmd.edit(prefix .. E .. "/container-only/brand-new.txt")
+vim.api.nvim_buf_set_lines(0, 0, -1, false, { "fresh" })
+vim.cmd("silent write")
+check("new remote file created", read(E .. "/container-only/brand-new.txt") == "fresh\n", read(E .. "/container-only/brand-new.txt"))
 
 -- 7. DAP proxy -------------------------------------------------------------------------------
 local adapter = require("devcontainer").dap_adapter({ command = "python3", args = { root .. "/tests/fake-dap.py" } })
@@ -228,6 +282,107 @@ local rit_reply = find(function(m) return m.type == "event" and m.body and m.bod
 check("host pid stripped from runInTerminal response", rit_reply and not rit_reply.body.output:find("4242"), rit_reply)
 send({ type = "request", command = "disconnect", arguments = {} })
 
+-- 7a. TCP (server) adapters like codelldb: started in the container, reached through a relay ---
+local tcp_resolved
+require("devcontainer").dap_adapter({
+  type = "server", port = "${port}",
+  executable = { command = "python3", args = { root .. "/tests/fake-dap.py", "--port", "${port}" } },
+})(function(a) tcp_resolved = a end, { cwd = HOST })
+check("tcp adapter started in the container and proxied", wait(15000, function() return tcp_resolved ~= nil end)
+  and tcp_resolved.type == "server" and tcp_resolved.port > 0, tcp_resolved)
+if tcp_resolved then
+  local tmsgs, tconnected = {}, false
+  local tfeed = dap.framer(function(body) table.insert(tmsgs, vim.json.decode(body)) end)
+  local tsock = vim.uv.new_tcp()
+  tsock:connect("127.0.0.1", tcp_resolved.port, function(err)
+    assert(not err, err)
+    tconnected = true
+    tsock:read_start(function(_, data) if data then tfeed(data) end end)
+  end)
+  wait(5000, function() return tconnected end)
+  tsock:write(dap.frame(vim.json.encode({ seq = 1, type = "request", command = "initialize", arguments = {} })))
+  tsock:write(dap.frame(vim.json.encode({ seq = 2, type = "request", command = "launch",
+    arguments = { program = HOST .. "/build/app", cwd = HOST } })))
+  local tseen
+  wait(10000, function()
+    for _, m in ipairs(tmsgs) do
+      if m.type == "event" and m.body and m.body.category == "seen" then tseen = vim.json.decode(m.body.output) end
+    end
+    return tseen ~= nil
+  end)
+  check("tcp adapter got container paths", tseen and tseen.args.program == REMOTE .. "/build/app" and tseen.cwd == REMOTE, tseen)
+  tsock:write(dap.frame(vim.json.encode({ seq = 3, type = "request", command = "disconnect", arguments = {} })))
+  tsock:close()
+end
+
+-- 7d. port forwarding ----------------------------------------------------------------------------
+local ports = require("devcontainer.ports")
+local echo_port
+-- a server "in the container" (same network as the host in this fake), bound to a port that is
+-- therefore also taken on the host: the forward has to pick another local port
+local echo = vim.system({ "python3", "-c", [[
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(5)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept()
+    c.sendall(b"echo:" + c.recv(1024))
+    c.close()
+]] }, { stdout = function(_, d) if d and not echo_port then echo_port = tonumber(d:match("%d+")) end end })
+wait(5000, function() return echo_port ~= nil end)
+local function roundtrip(local_port)
+  local got, c = nil, vim.uv.new_tcp()
+  c:connect("127.0.0.1", local_port, function(err)
+    if err then got = "connect: " .. err return end
+    c:read_start(function(_, d)
+      if d then got = (got or "") .. d else c:close() end
+    end)
+    c:write("hi")
+  end)
+  wait(10000, function() return got == "echo:hi" end)
+  return got
+end
+for _, kind in ipairs({ "bash", "python3" }) do
+  require("devcontainer.config").options.ports.relay = function(h, p) return ports.relay_argv(kind, h, p) end
+  require("devcontainer.profiles").invalidate()
+  vim.cmd("Devcontainer forward " .. echo_port)
+  local fwd
+  for _, f in ipairs(ports.list(session)) do
+    if f.port == echo_port then fwd = f end
+  end
+  check(kind .. " relay: forwarded to another local port", fwd and fwd.local_port ~= echo_port, fwd)
+  if fwd then check(kind .. " relay: data goes through the container", roundtrip(fwd.local_port) == "echo:hi") end
+  vim.cmd("Devcontainer unforward " .. echo_port)
+  check(kind .. " relay: unforward stops it", #vim.tbl_filter(function(f) return f.port == echo_port end, ports.list(session)) == 0)
+end
+require("devcontainer.config").options.ports.relay = nil
+require("devcontainer.profiles").invalidate()
+echo:kill(9)
+
+-- 7e. :Devcontainer files (vim.ui.select picker) ---------------------------------------------------
+answers["devcontainer.files"] = function(items)
+  for _, p in ipairs(items) do
+    if p:match("note%.txt$") then return p end
+  end
+end
+vim.cmd("Devcontainer files " .. E .. "/container-only")
+check("files: container file opened as devcontainer://", vim.api.nvim_buf_get_name(0) == "devcontainer://" .. session.key .. E .. "/container-only/note.txt",
+  vim.api.nvim_buf_get_name(0))
+
+-- 7f. :Devcontainer init (no CLI: a minimal image config) -----------------------------------------
+vim.fn.mkdir(E .. "/newproj/.git", "p")
+answers["devcontainer.template"] = function(items) return items[1] end
+answers["devcontainer.start"] = "Later"
+require("devcontainer.templates").init(E .. "/newproj")
+local created
+check("init: devcontainer.json written and opened", wait(5000, function()
+  created = read(E .. "/newproj/.devcontainer/devcontainer.json")
+  return created ~= nil and vim.api.nvim_buf_get_name(0) == E .. "/newproj/.devcontainer/devcontainer.json"
+end) and created:find('"image": "mcr.microsoft.com/devcontainers/cpp:latest"', 1, true) ~= nil, created)
+
 -- 7b. :Devcontainer exec -----------------------------------------------------------------------
 vim.cmd.buffer(main_buf)
 vim.cmd("Devcontainer exec echo hi-from-$PWD")
@@ -245,6 +400,22 @@ check("info/statusline/checkhealth run", pcall(function()
   vim.cmd("close")
 end))
 
+-- 7c. saving devcontainer.json offers a rebuild --------------------------------------------------
+vim.cmd.edit(HOST .. "/.devcontainer/devcontainer.json")
+answers["devcontainer.rebuild"] = "Rebuild now"
+vim.api.nvim_buf_set_lines(0, 0, 0, false, { "// edited" })
+vim.cmd("silent write")
+check("rebuild offered and done after saving the config", wait(20000, function()
+  local log_now = read(E .. "/docker.log") or ""
+  return answers["devcontainer.rebuild"] == nil and select(2, log_now:gsub('"run", "%-d"', "")) == 2
+    and require("devcontainer").get(HOST) ~= nil
+end), answers)
+session = require("devcontainer").get(HOST)
+check("clangd back in the rebuilt container", wait(15000, function()
+  local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
+  return c and c.config._devcontainer_key == session.key and c.initialized
+end))
+
 -- 8. :Devcontainer stop moves clangd back to the host ----------------------------------------
 vim.cmd.buffer(main_buf)
 vim.cmd("Devcontainer stop")
@@ -256,6 +427,22 @@ check("clangd back on the host", wait(10000, function()
   local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
   return c and c.config._devcontainer_key == nil and c.initialized
 end))
+check("Detached event", events[#events][1] == "DevcontainerDetached" and events[#events][2].local_folder == HOST, events[#events])
+
+-- 8b. the config changed while no Neovim was watching: `up` asks before reusing the container --
+write(HOST .. "/.devcontainer/devcontainer.json", (read(HOST .. "/.devcontainer/devcontainer.json") or "") .. "\n// changed on disk\n")
+answers["devcontainer.rebuild"] = "Start the existing container"
+vim.cmd.buffer(main_buf)
+vim.cmd("Devcontainer up")
+check("up asks about a container older than its config", wait(20000, function()
+  return answers["devcontainer.rebuild"] == nil and require("devcontainer").get(HOST) ~= nil
+end))
+check("existing container reused", select(2, (read(E .. "/docker.log") or ""):gsub('"run", "%-d"', "")) == 2)
+vim.cmd("Devcontainer stop")
+wait(10000, function()
+  local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
+  return c and c.config._devcontainer_key == nil and c.initialized
+end)
 
 -- 9. devcontainer CLI backend ----------------------------------------------------------------
 write(E .. "/bin/devcontainer", read(root .. "/tests/fake-devcontainer-cli.py"))
@@ -278,8 +465,18 @@ if session then
     return c and c.config._devcontainer_key == session.key and c.initialized
   end))
   loc = definition(3, 20)
-  check("cli: definitions still map to host paths", loc and loc.uri == vim.uri_from_fname(HOST .. "/util.h"), loc)
+  check("cli: definitions still map to host paths", loc and loc.uri == vim.uri_from_fname(HOST .. "/util.h"), loc
+    or vim.tbl_map(function(c) -- which client didn't answer
+      return { c.id, c.name, c.config._devcontainer_key, initialized = c.initialized, stopped = c:is_stopped() }
+    end, vim.lsp.get_clients({ bufnr = main_buf })))
 end
+
+-- 10. :Devcontainer down removes the container -------------------------------------------------
+vim.cmd.buffer(main_buf)
+require("devcontainer").down({ confirm = false })
+check("down: detached and container removed", require("devcontainer").get(HOST) == nil and wait(5000, function()
+  return (read(E .. "/docker.log") or ""):find('"rm", "-f", "cc0123456789', 1, true) ~= nil
+end))
 
 io.stdout:write(failures == 0 and "\nall e2e checks passed\n" or ("\n%d e2e checks failed\n"):format(failures))
 for _, c in ipairs(vim.lsp.get_clients()) do c:stop(true) end

@@ -1,0 +1,61 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    name: unit (nvim ${{ matrix.nvim }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: [v0.11.4, stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        id: nvim
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+      - name: Unit tests
+        run: ${{ steps.nvim.outputs.executable }} --headless --clean -l tests/unit.lua
+      - name: Help tags
+        run: >
+          ${{ steps.nvim.outputs.executable }} --headless --clean
+          -c 'lua local ok, e = pcall(vim.cmd.helptags, "doc"); if not ok then io.stderr:write(e .. "\n"); os.exit(1) end'
+          -c qa
+
+  e2e:
+    name: e2e (nvim ${{ matrix.nvim }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        nvim: [v0.11.4, stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/action-setup-vim@v1
+        id: nvim
+        with:
+          neovim: true
+          version: ${{ matrix.nvim }}
+      - name: Install clangd and ninja
+        run: sudo apt-get update -q && sudo apt-get install -y -q clangd ninja-build
+      - name: Fetch the integrated plugins
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugins"
+          for repo in stevearc/overseer.nvim stevearc/conform.nvim mfussenegger/nvim-lint \
+                      nvim-neotest/neotest nvim-neotest/nvim-nio nvim-lua/plenary.nvim \
+                      folke/snacks.nvim nvim-telescope/telescope.nvim akinsho/toggleterm.nvim \
+                      j-hui/fidget.nvim; do
+            git clone --quiet --depth 1 "https://github.com/$repo" "$RUNNER_TEMP/plugins/${repo#*/}"
+          done
+      # root for the mount namespaces of the fake docker (tests/fake-docker.py)
+      - name: End-to-end tests
+        run: >
+          sudo -E env "PATH=$PATH" "HOME=$HOME"
+          NVIM="${{ steps.nvim.outputs.executable }}" PLUGINS="$RUNNER_TEMP/plugins"
+          sh tests/run.sh

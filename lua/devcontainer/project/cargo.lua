@@ -18,7 +18,8 @@ function M.detect(path, boundary)
   local found = vim.fs.find("Cargo.toml", { upward = true, path = path, stop = stop, type = "file", limit = math.huge })
   if #found == 0 then return nil end
   for i = #found, 1, -1 do
-    if (read(found[i]) or ""):find("^%s*%[workspace%]") or (read(found[i]) or ""):find("\n%s*%[workspace%]") then
+    local toml = read(found[i]) or ""
+    if toml:find("^%s*%[workspace%]") or toml:find("\n%s*%[workspace%]") then
       return vim.fs.dirname(found[i])
     end
   end
@@ -29,11 +30,14 @@ local function profile(ctx)
   return ctx.state.profile or ctx.opts.profile or "dev"
 end
 
+--- --release / --profile x, plus the configured features
 local function profile_args(ctx)
   local p = profile(ctx)
-  if p == "dev" then return {} end
-  if p == "release" then return { "--release" } end
-  return { "--profile", p }
+  local out = p == "release" and { "--release" } or p ~= "dev" and { "--profile", p } or {}
+  local features = ctx.opts.features or {}
+  if #features > 0 then vim.list_extend(out, { "--features", table.concat(features, ",") }) end
+  if ctx.opts.no_default_features then table.insert(out, "--no-default-features") end
+  return out
 end
 
 local function profile_dir(ctx)
@@ -49,13 +53,13 @@ local metadata_cache = {}
 function M.metadata(ctx)
   local stat = vim.uv.fs_stat(ctx.root .. "/Cargo.toml")
   local key = ctx.root .. (ctx.session and ctx.session.key or "") .. (stat and stat.mtime.sec or "")
-  if metadata_cache[key] then return metadata_cache[key] end
+  if metadata_cache[key] then return metadata_cache[key].data end
   local res = ctx:system({ "cargo", "metadata", "--no-deps", "--format-version", "1" })
   if res.code ~= 0 then
     error("cargo metadata failed: " .. vim.trim(res.stderr or ""):sub(-300), 0)
   end
   local data = vim.json.decode(res.stdout, { luanil = { object = true, array = true } })
-  metadata_cache[key] = data
+  metadata_cache[key] = { root = ctx.root, data = data }
   return data
 end
 
@@ -86,9 +90,11 @@ end
 
 function M.targets(ctx)
   local names = {}
-  for key, meta in pairs(metadata_cache) do
-    if vim.startswith(key, ctx.root) then
-      for _, b in ipairs(bins(meta)) do table.insert(names, b.name) end
+  for _, entry in pairs(metadata_cache) do
+    if entry.root == ctx.root then
+      for _, b in ipairs(bins(entry.data)) do
+        if not vim.tbl_contains(names, b.name) then table.insert(names, b.name) end
+      end
     end
   end
   return names
@@ -167,16 +173,29 @@ M.actions = {
   {
     name = "check",
     desc = "cargo check --all-targets",
-    run = function(ctx, args) return { cargo(ctx, "check", vim.list_extend({ "--all-targets" }, args.extra)) } end,
+    run = function(ctx, args)
+      return { cargo(ctx, "check", vim.list_extend(vim.list_extend({ "--all-targets" }, profile_args(ctx)), args.extra)) }
+    end,
   },
   {
     name = "clippy",
     desc = "cargo clippy --all-targets",
-    run = function(ctx, args) return { cargo(ctx, "clippy", vim.list_extend({ "--all-targets" }, args.extra)) } end,
+    run = function(ctx, args)
+      return { cargo(ctx, "clippy", vim.list_extend(vim.list_extend({ "--all-targets" }, profile_args(ctx)), args.extra)) }
+    end,
   },
   { name = "fmt", desc = "cargo fmt", run = function(ctx, args) return { cargo(ctx, "fmt", args.extra) } end },
   { name = "doc", desc = "cargo doc", run = function(ctx, args) return { cargo(ctx, "doc", args.extra) } end },
 }
+
+--- Cargo profiles: the built-in ones plus the [profile.<name>] sections of the root Cargo.toml.
+function M.profiles(root)
+  local out = { "dev", "release" }
+  for name in ("\n" .. (read(root .. "/Cargo.toml") or "")):gmatch("\n%s*%[profile%.([%w_%-]+)%]") do
+    if not vim.tbl_contains(out, name) then table.insert(out, name) end
+  end
+  return out
+end
 
 function M.settings(ctx)
   local items = {
@@ -186,7 +205,7 @@ function M.settings(ctx)
   local choice = async.select(items, { prompt = "Cargo settings", format_item = function(i) return i.label end })
   if not choice then return end
   if choice.key == "profile" then
-    local p = async.select({ "dev", "release" }, { prompt = "Profile" })
+    local p = async.select(M.profiles(ctx.root), { prompt = "Profile" })
     if p then ctx:set("profile", p) end
   else
     ctx:set("target", nil)
@@ -195,7 +214,8 @@ function M.settings(ctx)
 end
 
 function M.describe(ctx)
-  return "profile " .. profile(ctx)
+  local features = ctx.opts.features or {}
+  return "cargo profile " .. profile(ctx) .. (#features > 0 and (", features " .. table.concat(features, ",")) or "")
 end
 
 return M

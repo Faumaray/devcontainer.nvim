@@ -1,10 +1,16 @@
 #!/bin/sh
-# Usage: NVIM=/path/to/nvim [OVERSEER=/path/to/overseer.nvim] tests/run.sh
-# The e2e suites need root (mount namespaces), python3 and clangd; the project suite also needs
-# cmake, ninja, a C++ compiler and cargo.
+# Usage: NVIM=/path/to/nvim [PLUGINS=/dir/with/plugins] [OVERSEER=/path/to/overseer.nvim] tests/run.sh
+# $PLUGINS holds overseer.nvim, conform.nvim, nvim-lint, neotest, nvim-nio, plenary.nvim,
+# snacks.nvim, telescope.nvim, toggleterm.nvim and fidget.nvim (missing ones are skipped).
+# The e2e suites need root (mount namespaces), python3, git and clangd; the project suite also
+# needs cmake, ninja, a C++ compiler and cargo.
 set -e
 cd "$(dirname "$0")/.."
 NVIM=${NVIM:-nvim}
+if [ -z "$OVERSEER" ] && [ -n "$PLUGINS" ] && [ -d "$PLUGINS/overseer.nvim" ]; then
+  OVERSEER="$PLUGINS/overseer.nvim"
+fi
+export OVERSEER PLUGINS
 "$NVIM" --headless --clean -l tests/unit.lua
 if [ "$(id -u)" != 0 ] || ! command -v python3 >/dev/null; then
   echo "skipping e2e (needs root and python3)"
@@ -12,6 +18,7 @@ if [ "$(id -u)" != 0 ] || ! command -v python3 >/dev/null; then
 fi
 if command -v clangd >/dev/null; then
   "$NVIM" --headless --clean -l tests/e2e.lua
+  "$NVIM" --headless --clean -l tests/e2e_lsp_start.lua
 else
   echo "skipping LSP/DAP e2e (needs clangd)"
 fi
@@ -19,4 +26,9 @@ if command -v cmake >/dev/null && command -v ninja >/dev/null && command -v carg
   "$NVIM" --headless --clean -l tests/e2e_project.lua
 else
   echo "skipping project e2e (needs cmake, ninja, cargo)"
+fi
+if [ -n "$PLUGINS" ]; then
+  "$NVIM" --headless --clean -l tests/e2e_integrations.lua
+else
+  echo "skipping integrations e2e (set PLUGINS)"
 fi

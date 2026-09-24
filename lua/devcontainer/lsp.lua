@@ -11,12 +11,13 @@ local M = {}
 
 local helpers = setmetatable({}, { __mode = "k" }) -- cmd functions created by M.cmd() -> argv
 
-local function opts()
-  return config.options.lsp
+--- LSP options for a workspace root (profiles applied), or the global ones.
+local function opts(root)
+  return config.get(root).lsp
 end
 
-function M.managed(name)
-  local o = opts()
+function M.managed(name, root)
+  local o = opts(root)
   if not o.enabled or not name then return false end
   if vim.tbl_contains(o.exclude or {}, name) then return false end
   return o.servers == "*" or vim.tbl_contains(o.servers or {}, name)
@@ -34,25 +35,20 @@ local function host_cmd_of(cfg)
   if type(cfg.cmd) == "table" then return cfg.cmd end
   if type(cfg.cmd) == "function" then return helpers[cfg.cmd] end
 end
+M.host_cmd = host_cmd_of
 
---- Rewrite host paths inside command-line arguments (--compile-commands-dir=/home/me/proj/build).
-local function map_arg(session, arg)
-  if type(arg) ~= "string" then return arg end
-  for _, root in ipairs(session.local_roots) do
-    local i = arg:find(root, 1, true)
-    if i then
-      local after = arg:sub(i + #root, i + #root)
-      if after == "" or after == "/" then
-        return arg:sub(1, i - 1) .. session.remote_folder .. arg:sub(i + #root)
-      end
-    end
-  end
-  return arg
+-- private Neovim helpers, with fallbacks in case they move
+local resolve_bufnr = vim._resolve_bufnr or function(bufnr)
+  return (bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr
+end
+local get_workspace_folders = vim.lsp._get_workspace_folders or function(folders)
+  if type(folders) == "table" then return folders end
+  if type(folders) == "string" then return { { uri = vim.uri_from_fname(folders), name = folders } } end
 end
 
 --- argv to run inside the container, or nil when the server isn't installed there.
 local function remote_argv(session, name, host_cmd)
-  local override = opts().remote_cmd[name]
+  local override = opts(session.local_folder).remote_cmd[name]
   if type(override) == "function" then override = override(host_cmd, session) end
   if type(override) == "table" then return override end
 
@@ -64,7 +60,7 @@ local function remote_argv(session, name, host_cmd)
   end
   if not found then return nil end
   local argv = { found }
-  for i = 2, #host_cmd do argv[#argv + 1] = map_arg(session, host_cmd[i]) end
+  for i = 2, #host_cmd do argv[#argv + 1] = session:map_arg(host_cmd[i]) end
   return argv
 end
 
@@ -135,23 +131,32 @@ end
 function M.rewrite(cfg)
   local host_cmd = host_cmd_of(cfg)
   local name = cfg.name or (type(host_cmd) == "table" and vim.fs.basename(host_cmd[1])) or nil
-  if not host_cmd or not M.managed(name) then return cfg end
-
   local root = M.root_of(cfg)
   local session = root and registry.find(root)
+  if not host_cmd then return cfg end
+  if not M.managed(name, session and session.local_folder) then
+    if not cfg._devcontainer_host_cmd then return cfg end
+    -- was running in a container, now excluded (profile change): back to the host command
+    local host = vim.tbl_extend("force", {}, cfg, { cmd = host_cmd })
+    host._devcontainer_host_cmd, host._devcontainer_key = nil, nil
+    return host
+  end
+
   local new = vim.tbl_extend("force", {}, cfg)
   new.name = name
   new._devcontainer_host_cmd = host_cmd
   new._devcontainer_key = nil
 
   if not session then
+    -- installed only in the container (lsp_cmd, or a config adopted while attached): wait for it
+    if vim.fn.executable(host_cmd[1]) == 0 then return nil end
     new.cmd = cfg._devcontainer_host_cmd and host_cmd or cfg.cmd
     return new
   end
 
   local argv = remote_argv(session, name, host_cmd)
   if not argv then
-    local fallback = opts().fallback
+    local fallback = opts(session.local_folder).fallback
     if not session.warned[name] then
       session.warned[name] = true
       log.warn(("%s not found in container %s — %s"):format(
@@ -172,9 +177,9 @@ end
 -- Same as Neovim's default reuse_client (not exported).
 local function default_reuse(client, cfg)
   if client.name ~= cfg.name or client:is_stopped() then return false end
-  local folders = vim.lsp._get_workspace_folders(cfg.workspace_folders or cfg.root_dir)
+  local folders = get_workspace_folders(cfg.workspace_folders or cfg.root_dir)
   if not folders or not next(folders) then
-    local cf = vim.lsp._get_workspace_folders(client.config.workspace_folders or client.config.root_dir)
+    local cf = get_workspace_folders(client.config.workspace_folders or client.config.root_dir)
     return not cf or not next(cf)
   end
   for _, f in ipairs(folders) do
@@ -204,11 +209,20 @@ function M.patch()
   patched = true
   local orig_start = vim.lsp.start
 
+  local orig_enable = vim.lsp.enable
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.enable = function(name, enable)
+    if enable ~= false and opts().enabled then
+      pcall(M.adopt, type(name) == "table" and name or { name })
+    end
+    return orig_enable(name, enable)
+  end
+
   ---@diagnostic disable-next-line: duplicate-set-field
   vim.lsp.start = function(cfg, start_opts)
     start_opts = start_opts or {}
     if type(cfg) ~= "table" or not opts().enabled then return orig_start(cfg, start_opts) end
-    local bufnr = vim._resolve_bufnr(start_opts.bufnr)
+    local bufnr = resolve_bufnr(start_opts.bufnr)
 
     -- container-only files (devcontainer://<id>/usr/include/...) only talk to that container's servers
     local key = vim.api.nvim_buf_get_name(bufnr):match("^devcontainer://([^/]+)")
@@ -255,6 +269,19 @@ local function inside(path, folder)
   return path == folder or path:sub(1, #folder + 1) == folder .. "/"
 end
 
+--- Executables of the running clients whose workspace is `folder` (or below): what `up` has to
+--- look up in the container before moving them (see Session:prefetch).
+function M.binaries(folder)
+  local out = {}
+  for _, c in ipairs(vim.lsp.get_clients()) do
+    local root, cmd = M.root_of(c.config), host_cmd_of(c.config)
+    if root and inside(root, folder) and type(cmd) == "table" and type(cmd[1]) == "string" then
+      vim.list_extend(out, { cmd[1], vim.fs.basename(cmd[1]) })
+    end
+  end
+  return out
+end
+
 ---@class devcontainer.LspEntry
 ---@field client vim.lsp.Client
 ---@field config table
@@ -279,19 +306,51 @@ function M.stop_clients(folder, key)
   return entries
 end
 
+-- folder -> the move in progress: its clients are still exiting
+local moves = {}
+
 --- Wait (≤3s) for the stopped clients to exit, then start them again for their buffers.
 --- Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
+---
+--- One move per workspace: a newer one (stop right after up, up with another backend, ...) takes
+--- over the clients of the one still waiting, instead of both starting them when their timers fire.
 ---@param entries devcontainer.LspEntry[]
-function M.start_clients(entries)
-  if #entries == 0 then return end
+---@param after? fun()  called once the clients have been started again
+---@param folder? string  workspace the move belongs to
+function M.start_clients(entries, after, folder)
+  local previous = folder and moves[folder]
+  if previous then
+    previous.cancel()
+    local seen = {}
+    for _, e in ipairs(entries) do seen[e.client.id] = true end
+    for _, e in ipairs(previous.entries) do
+      if not seen[e.client.id] then
+        seen[e.client.id] = true
+        entries[#entries + 1] = e
+      end
+    end
+  end
+  if #entries == 0 then
+    if after then after() end
+    return
+  end
   local timer = assert(vim.uv.new_timer())
+  local move = { entries = entries }
+  function move.cancel()
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    if folder and moves[folder] == move then moves[folder] = nil end
+  end
+  if folder then moves[folder] = move end
   local waited = 0
   timer:start(0, 100, vim.schedule_wrap(function()
+    if timer:is_closing() then return end
     waited = waited + 100
     local pending = vim.tbl_filter(function(e) return not e.client:is_stopped() end, entries)
     if #pending > 0 and waited < 3000 then return end
-    timer:stop()
-    timer:close()
+    move.cancel()
     for _, e in ipairs(pending) do e.client:stop(true) end
 
     for _, e in ipairs(entries) do
@@ -308,10 +367,48 @@ function M.start_clients(entries)
         end
       end
     end
+    if after then after() end
   end))
 end
 
+--- vim.lsp.enable() won't start a config whose cmd[1] isn't executable on the host (clangd
+--- installed only in the container). While a container is attached, such configs get a cmd
+--- function (M.cmd), which it accepts; the patched vim.lsp.start then runs it in the container.
+---@param names? string[]  default: every enabled config
+function M.adopt(names)
+  if next(registry.by_key) == nil then return end
+  names = names or vim.tbl_keys(vim.lsp._enabled_configs or {})
+  for _, name in ipairs(names) do
+    local ok, cfg = pcall(function() return vim.lsp.config[name] end)
+    local cmd = ok and type(cfg) == "table" and cfg.cmd
+    if type(cmd) == "table" and type(cmd[1]) == "string" and vim.fn.executable(cmd[1]) == 0 and M.managed(name) then
+      vim.lsp.config(name, { cmd = M.cmd(cmd) })
+    end
+  end
+end
+
+--- Run the startup of vim.lsp.enable() (and nvim-lspconfig's setup()) again for the file buffers
+--- in `folder`: servers that couldn't start before the container was attached start now.
+function M.retrigger(folder)
+  local roots = { folder, vim.uv.fs_realpath(folder) }
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(buf)
+    local in_folder = false
+    for _, r in ipairs(roots) do
+      in_folder = in_folder or (name ~= "" and inside(name, r))
+    end
+    if in_folder and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "" and vim.bo[buf].filetype ~= "" then
+      for _, group in ipairs({ "nvim.lsp.enable", "lspconfig" }) do
+        if pcall(vim.api.nvim_get_autocmds, { group = group, event = "FileType" }) then
+          pcall(vim.api.nvim_exec_autocmds, "FileType", { group = group, buffer = buf, modeline = false })
+        end
+      end
+    end
+  end
+end
+
 --- Move every client of `folder` to wherever it should run now (container or host).
+--- Then start the servers that couldn't run before (see M.adopt / M.retrigger).
 function M.restart(folder, entries)
   entries = entries or {}
   local seen = {}
@@ -319,7 +416,8 @@ function M.restart(folder, entries)
   for _, e in ipairs(M.stop_clients(folder)) do
     if not seen[e.client.id] then entries[#entries + 1] = e end
   end
-  M.start_clients(entries)
+  M.adopt()
+  M.start_clients(entries, function() M.retrigger(folder) end, folder)
 end
 
 return M

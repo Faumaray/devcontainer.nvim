@@ -159,10 +159,15 @@ test("lsp.rewrite: runs managed server in the container", function()
   eq(new._devcontainer_key, s.key)
   eq(new._devcontainer_host_cmd, cfg.cmd)
   eq(type(cfg.cmd), "table", "original config untouched")
-  -- restart after the container is gone: back to the host command
+  -- restart after the container is gone: back to the host command when the host has it
   session_mod.unregister(s)
-  local back = lsp.rewrite(new)
-  eq(back.cmd, cfg.cmd)
+  eq(lsp.rewrite(new), nil, "not installed on the host: not started")
+  local sh = vim.fn.exepath("sh")
+  session_mod.register(s)
+  local moved = lsp.rewrite({ name = "clangd", cmd = { sh, "-c", "true" }, root_dir = "/home/me/proj" })
+  session_mod.unregister(s)
+  local back = lsp.rewrite(moved)
+  eq(back.cmd, { sh, "-c", "true" })
   eq(back._devcontainer_key, nil)
 end)
 
@@ -188,7 +193,11 @@ test("lsp.cmd helper: host-less servers still move into the container", function
   eq(new._devcontainer_key, s.key)
   eq(new._devcontainer_host_cmd, { "clangd", "--background-index" })
   session_mod.unregister(s)
-  eq(lsp.rewrite({ name = "clangd", cmd = fn, root_dir = "/home/me/proj" }).cmd, fn)
+  -- detached: the host command when the host has it, else nothing (no spawn error)
+  local missing = lsp.cmd({ "definitely-not-on-this-host" })
+  eq(lsp.rewrite({ name = "clangd", cmd = missing, root_dir = "/home/me/proj" }), nil)
+  local on_host = lsp.cmd({ vim.fn.exepath("sh") })
+  eq(lsp.rewrite({ name = "clangd", cmd = on_host, root_dir = "/home/me/proj" }).cmd, on_host)
 end)
 
 local dap = require("devcontainer.dap")
@@ -410,6 +419,480 @@ test("autostart: ask once, remember always/never", function()
   eq(#started, 1)
   require("devcontainer.config").set({})
   dcm.up, vim.ui.select = orig_up, orig_select
+end)
+
+test("lsp: host-less servers adopted while attached, not spawned on the host when detached", function()
+  require("devcontainer.config").set({ lsp = { exclude = { "excluded_srv" } } })
+  lsp.patch()
+  vim.lsp.config("hostless_srv", { cmd = { "definitely-not-on-this-host" }, filetypes = { "hostless" } })
+  vim.lsp.config("excluded_srv", { cmd = { "definitely-not-on-this-host" }, filetypes = { "hostless" } })
+  vim.lsp.enable({ "hostless_srv", "excluded_srv" })
+  eq(type(vim.lsp.config.hostless_srv.cmd), "table", "nothing attached: config untouched")
+  local s = fake_session({})
+  session_mod.register(s)
+  vim.lsp.enable({ "hostless_srv", "excluded_srv" })
+  eq(type(vim.lsp.config.hostless_srv.cmd), "function", "adopted: vim.lsp.enable accepts it now")
+  eq(type(vim.lsp.config.excluded_srv.cmd), "table", "excluded servers are left alone")
+  session_mod.unregister(s)
+  local cfg = { name = "hostless_srv", cmd = lsp.cmd({ "definitely-not-on-this-host" }), root_dir = "/home/me/proj" }
+  eq(lsp.rewrite(cfg), nil, "detached: not started (no spawn error)")
+  vim.lsp.enable({ "hostless_srv", "excluded_srv" }, false)
+  require("devcontainer.config").set({})
+end)
+
+-- fixes ----------------------------------------------------------------------------------------
+
+test("spec.find_root needs a config, not just a .devcontainer folder", function()
+  local base = tmp .. "/roots"
+  writef(base .. "/outer/.devcontainer/devcontainer.json", "{}")
+  writef(base .. "/outer/inner/.devcontainer/Dockerfile", "FROM x")
+  vim.fn.mkdir(base .. "/outer/inner/src", "p")
+  eq(spec.find_root(base .. "/outer/inner/src"), base .. "/outer")
+  writef(base .. "/outer/inner/.devcontainer/cpp/devcontainer.json", "{}")
+  eq(spec.find_root(base .. "/outer/inner/src"), base .. "/outer/inner")
+  eq(spec.find_root_cached(base .. "/outer/inner/src"), base .. "/outer/inner")
+end)
+
+test("paths.replace_root / session:map_arg replace whole paths only", function()
+  eq(paths.replace_root("a /ws/p:1 /ws/p/x '/ws/p' /ws/p2 /x/ws/p", "/ws/p", "/h"), "a /h:1 /h/x '/h' /ws/p2 /x/ws/p")
+  local s = fake_session({})
+  eq(s:map_arg("--compile-commands-dir=/home/me/proj/build"), "--compile-commands-dir=/workspaces/proj/build")
+  eq(s:map_arg("cd /home/me/proj && make -C /home/me/proj/sub"), "cd /workspaces/proj && make -C /workspaces/proj/sub")
+  eq(s:map_arg("/home/me/project2/x"), "/home/me/project2/x")
+  eq(s:map_arg(42), 42)
+end)
+
+test("get(path) does not fall back to the current session", function()
+  local s = fake_session({})
+  session_mod.register(s)
+  local dcm = require("devcontainer")
+  eq(dcm.get("/home/me/proj/a.c"), s)
+  eq(dcm.get("/somewhere/else"), nil)
+  session_mod.unregister(s)
+end)
+
+test("registry.pick: current, only one, or ask", function()
+  local a, b = fake_session({}), session_mod.new({ container_id = "fedcba9876543210", local_folder = "/other", remote_folder = "/w/o", docker = "docker" })
+  local got, asked = "unset", 0
+  local orig = vim.ui.select
+  vim.ui.select = function(items, _, cb) asked = asked + 1; cb(items[2]) end
+  session_mod.pick(function(s) got = s end)
+  eq(got, nil)
+  session_mod.register(a)
+  session_mod.pick(function(s) got = s end)
+  eq({ got, asked }, { a, 0 })
+  session_mod.register(b)
+  session_mod.pick(function(s) got = s end)
+  eq(asked, 1)
+  session_mod.unregister(a)
+  session_mod.unregister(b)
+  vim.ui.select = orig
+end)
+
+test("cargo: custom profiles from Cargo.toml", function()
+  writef(tmp .. "/prof/Cargo.toml", '[profile.ci]\ninherits = "release"\n[profile.ci.package.foo]\nopt-level = 1\n[profile.fast]\n')
+  eq(cargo.profiles(tmp .. "/prof"), { "dev", "release", "ci", "fast" })
+end)
+
+-- profiles -------------------------------------------------------------------------------------
+
+local config = require("devcontainer.config")
+local profiles = require("devcontainer.profiles")
+
+test("config.merge: dicts merge, lists replace, *_args append in profile layers", function()
+  local base = { a = { x = 1, l = { 1, 2 } }, build_args = { "-j" }, s = "*" }
+  eq(config.merge(base, { a = { y = 2, l = { 3 } }, build_args = { "-v" }, s = { "clangd" } }),
+    { a = { x = 1, y = 2, l = { 3 } }, build_args = { "-v" }, s = { "clangd" } })
+  eq(config.merge(base, { build_args = { "-v" }, a = { l = {} } }, true), { a = { x = 1, l = {} }, build_args = { "-j", "-v" }, s = "*" })
+  eq(base.build_args, { "-j" }, "base untouched")
+end)
+
+vim.env.XDG_STATE_HOME = tmp .. "/state"
+vim.fn.mkdir(tmp .. "/state/nvim", "p")
+test("profiles: match, extends, customizations, selection", function()
+  local ws = tmp .. "/prof-ws"
+  local file = ws .. "/.devcontainer/devcontainer.json"
+  writef(file, vim.json.encode({
+    image = "x",
+    customizations = { ["devcontainer.nvim"] = {
+      profile = "team",
+      settings = { docker = "/tmp/evil", project = { cmake = { generator = "Ninja" }, debug = { command = { "rm" }, adapter = "lldb" } } },
+      profiles = { team = { desc = "shared", cli = "/tmp/evil", project = { cmake = { configure_args = { "-DTEAM=1" } } } } },
+    } },
+  }))
+  config.set({ profiles = {
+    base = { project = { cmake = { configure_args = { "-DBASE=1" } } } },
+    asan = { desc = "ASan", extends = "base", project = { cmake = { configure_args = { "-DASAN=1" }, build_type = "RelWithDebInfo" } } },
+    work = { match = ws, project = { env = { WORK = "1" } } },
+  } })
+  -- untrusted: customizations ignored
+  local o = config.get(ws)
+  eq(o.project.env, { WORK = "1" }, "folder profile applied")
+  eq(o.project.cmake.generator, nil, "untrusted customizations ignored")
+  eq(profiles.describe(ws).matched, { "work" })
+
+  vim.cmd.edit(file)
+  vim.secure.trust({ action = "allow", bufnr = 0 })
+  vim.cmd.bwipeout()
+  profiles.invalidate()
+  o = config.get(ws)
+  eq(o.project.cmake.generator, "Ninja", "trusted customization settings")
+  eq(o.docker, config.options.docker, "docker path can't come from the repository")
+  eq(o.project.debug.command, config.options.project.debug.command, "debug command can't come from the repository")
+  eq(o.project.debug.adapter, "lldb")
+  eq(profiles.describe(ws).selected, "team", "devcontainer.json default profile")
+  eq(o.project.cmake.configure_args, { "-DTEAM=1" })
+  eq(o.cli, config.options.cli)
+
+  profiles.set(ws, "asan")
+  o = config.get(ws)
+  eq(o.project.cmake.configure_args, { "-DBASE=1", "-DASAN=1" }, "extends chain, _args appended")
+  eq(o.project.cmake.build_type, "RelWithDebInfo")
+  eq(o.project.env, { WORK = "1" })
+  eq(profiles.active_name(ws), "asan")
+  eq(config.get(ws .. "/sub").project.cmake.build_type, "RelWithDebInfo", "subfolder uses the workspace selection")
+
+  profiles.set(ws, "none")
+  eq(profiles.describe(ws).selected, nil)
+  eq(config.get(ws).project.cmake.configure_args, {})
+  profiles.set(ws, nil)
+  eq(profiles.describe(ws).selected, "team")
+
+  eq(profiles.matches({ "~/nope", function(r) return r == "/x" end }, { "/x" }), true)
+  eq(profiles.matches(tmp .. "/*", { tmp .. "/a" }), true)
+  eq(profiles.matches(tmp .. "/*", { tmp .. "/a/b" }), false)
+  eq(profiles.matches(tmp, { tmp .. "/a/b" }), true, "plain folder matches below it")
+  config.set({})
+end)
+
+test("cmake: ${profile} macro and reconfigure when the configure settings change", function()
+  local root = tmp .. "/recfg"
+  writef(root .. "/CMakeLists.txt", "")
+  local opts = vim.deepcopy(config.options.project.cmake)
+  opts.build_dir = "build/${profile}-${buildType}"
+  local ctx = setmetatable({ root = root, provider = cmake, state = {}, opts = opts, profile = "asan",
+    options = config.options }, { __index = {
+      exec_path = function(_, x) return x end, task = function(_, t) t.cwd = root; return t end,
+    } })
+  local r = cmake.resolve(ctx)
+  eq(r.build_arg, "build/asan-Debug")
+  writef(r.host_build .. "/CMakeCache.txt", "")
+  local build = cmake.actions[2]
+  eq(#build.run(ctx, { extra = {} }), 1, "configured, nothing stored: just build")
+  cmake.after(ctx, "configure")
+  eq(#build.run(ctx, { extra = {} }), 1, "same settings: just build")
+  opts.configure_args = { "-DNEW=1" }
+  local steps = build.run(ctx, { extra = {} })
+  eq(steps[#steps - 1].cmd[#steps[#steps - 1].cmd], "-DNEW=1", "reconfigure before building")
+end)
+
+test("cargo: features and custom profile flags", function()
+  local ctx = setmetatable({ root = "/r", provider = cargo, state = {}, opts = { profile = "ci", features = { "a", "b" },
+    no_default_features = true, build_args = {}, test_args = {} } }, { __index = { task = function(_, t) return t end } })
+  eq(cargo.actions[2].run(ctx, { extra = {} })[1].cmd, { "cargo", "build", "--profile", "ci", "--features", "a,b", "--no-default-features" })
+  eq(cargo.actions[4].run(ctx, { extra = {} })[1].cmd, { "cargo", "test", "--profile", "ci", "--features", "a,b", "--no-default-features" })
+end)
+
+-- ports ----------------------------------------------------------------------------------------
+
+local ports = require("devcontainer.ports")
+test("ports.parse: forwardPorts + portsAttributes", function()
+  local specs = ports.parse({
+    forwardPorts = { 3000, "db:5432", "8080", "bogus" },
+    portsAttributes = {
+      ["3000"] = { label = "Web", onAutoForward = "openBrowser", protocol = "https" },
+      ["5000-6000"] = { label = "Range", requireLocalPort = true },
+    },
+    otherPortsAttributes = { onAutoForward = "silent" },
+  })
+  eq(#specs, 3)
+  eq(specs[1], { host = "localhost", port = 3000, label = "Web", on_auto_forward = "openBrowser", require_local_port = false, protocol = "https" })
+  eq(specs[2], { host = "db", port = 5432, label = "Range", on_auto_forward = "notify", require_local_port = true })
+  eq(specs[3].on_auto_forward, "silent")
+  eq({ ports.parse_arg("db:5432") }, { "db", 5432 })
+  eq({ ports.parse_arg(" 3000 ") }, { "localhost", 3000 })
+  eq(ports.parse_arg("x"), nil)
+end)
+
+test("ports: relay and readiness argv", function()
+  eq(ports.relay_argv("socat", "db", 5432), { "socat", "-", "TCP:db:5432" })
+  eq(ports.relay_argv("nc", "localhost", 80, "/bin/nc"), { "/bin/nc", "localhost", "80" })
+  local bash = ports.relay_argv("bash", "localhost", 80)
+  eq({ bash[1], bash[2], bash[4], bash[5] }, { "bash", "-c", "localhost", "80" })
+  local s = fake_session({ python3 = "/usr/bin/python3" })
+  local argv, kind = ports.relay_for(s, "localhost", 1)
+  eq({ argv[1], kind }, { "/usr/bin/python3", "python3" })
+  eq(ports.relay_for(fake_session({}), "localhost", 1), nil)
+  eq(ports.listening_argv(8080)[4], "8080")
+  local res = vim.system({ "sh", "-c", ports.listening_argv(1)[3], "1" }):wait()
+  eq(res.code ~= 0, true, "nothing listens on port 1")
+end)
+
+test("docker backend: appPort published, forwardPorts tunnelled instead", function()
+  local docker = require("devcontainer.backend.docker")
+  local args = docker.run_args({ docker = "docker", local_folder = "/p", remote_folder = "/w" },
+    { forwardPorts = { 3000 }, appPort = { 8000, "9000:9001" } }, "img", { "l1", "l2" })
+  local s = table.concat(args, " ")
+  eq(s:find("3000", 1, true), nil)
+  assert(s:find("-p 127.0.0.1:8000:8000", 1, true), s)
+  assert(s:find("-p 9000:9001", 1, true), s)
+end)
+
+-- command API + integrations (against stub plugins) ------------------------------------------
+
+local function scratch_named(name)
+  local buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(buf, name)
+  return buf
+end
+
+test("wrap_cmd: exec argv with mapped paths, unchanged without a container", function()
+  local dcm = require("devcontainer")
+  local s = fake_session({})
+  session_mod.register(s)
+  local argv, got = dcm.wrap_cmd({ "/home/me/.local/share/nvim/mason/bin/ruff", "check", "/home/me/proj/a.py" },
+    { path = "/home/me/proj/a.py", cwd = "/home/me/proj/sub" })
+  eq(got, s)
+  eq(argv, { "docker", "exec", "-i", "-u", "vscode", "-w", "/workspaces/proj/sub", "-e", "PATH=/usr/local/bin:/usr/bin",
+    "0123456789abcdef", "ruff", "check", "/workspaces/proj/a.py" })
+  eq(dcm.wrap_cmd({ "./run.sh" }, { path = "/home/me/proj" })[11], "./run.sh", "relative paths are kept")
+  eq({ dcm.wrap_cmd({ "ls" }, { path = "/elsewhere" }) }, { { "ls" } })
+  eq(dcm.shell_cmd({ path = "/elsewhere" }), nil)
+  eq(dcm.shell_cmd({ path = "/home/me/proj" })[3], "-it")
+  session_mod.unregister(s)
+end)
+
+test("conform: formatters run in the container, host config outside", function()
+  local util = { merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end }
+  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = { cpp = { "clang_format" }, py = { { "black" } } } }
+  package.loaded["conform"], package.loaded["conform.util"] = conform, util
+  package.loaded["conform.formatters.clang_format"] = { command = "clang-format", args = { "--assume-filename", "$FILENAME" } }
+  package.loaded["conform.formatters.black"] = { command = "black", args = { "--stdin-filename", "$FILENAME", "-" } }
+  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format" })
+  session_mod.register(s)
+  require("devcontainer.integrations.conform").setup()
+  eq(type(conform.formatters.clang_format), "function")
+  eq(type(conform.formatters.black), "function")
+  local buf = scratch_named("/home/me/proj/src/a.cpp")
+  local cfg = conform.formatters.clang_format(buf)
+  eq({ cfg.command, cfg.inherit }, { "docker", false })
+  local args = cfg.args(cfg, { filename = "/home/me/proj/src/a.cpp", dirname = "/home/me/proj/src", buf = buf })
+  eq(vim.list_slice(args, #args - 2), { "/usr/bin/clang-format", "--assume-filename", "/workspaces/proj/src/a.cpp" })
+  eq(args[1], "exec")
+  -- black isn't in the container: host definition (with the user's override merged)
+  local b = conform.formatters.black(buf)
+  eq({ b.command, b.inherit }, { "black", false })
+  local out = scratch_named("/elsewhere/a.cpp")
+  eq(conform.formatters.clang_format(out).command, "clang-format")
+  require("devcontainer.integrations.conform").setup() -- idempotent
+  eq(conform.formatters.clang_format(buf).command, "docker")
+  session_mod.unregister(s)
+  package.loaded["conform"], package.loaded["conform.util"] = nil, nil
+end)
+
+test("nvim-lint: linters run in the container, output mapped back", function()
+  local lint = { linters_by_ft = { python = { "mypy" } }, linters = {
+    mypy = { cmd = "mypy", args = { "--show-column-numbers", function() return "--x" end }, stdin = false,
+      parser = function(output) return output end },
+  } }
+  package.loaded["lint"] = lint
+  local s = fake_session({ mypy = "/usr/local/bin/mypy" })
+  session_mod.register(s)
+  require("devcontainer.integrations.lint").setup()
+  local buf = scratch_named("/home/me/proj/a.py")
+  vim.api.nvim_set_current_buf(buf)
+  local l = lint.linters.mypy()
+  eq({ l.cmd, l.append_fname, l.name }, { "docker", false, "mypy" })
+  eq(vim.list_slice(l.args, #l.args - 3), { "/usr/local/bin/mypy", "--show-column-numbers", "--x", "/workspaces/proj/a.py" })
+  eq(l.parser("/workspaces/proj/a.py:1:2: error: x"), "/home/me/proj/a.py:1:2: error: x")
+  vim.api.nvim_set_current_buf(scratch_named("/elsewhere/b.py"))
+  eq(lint.linters.mypy().cmd, "mypy")
+  session_mod.unregister(s)
+  package.loaded["lint"] = nil
+end)
+
+test("neotest: spec transform maps workspace, temp files and host-only scripts", function()
+  local s = fake_session({})
+  local run = require("devcontainer.integrations.neotest").transform({
+    command = { "python3", "/plugins/neotest-python/neotest.py", "--results-file", "/tmp/nvim.me/x/5", "--",
+      "/home/me/proj/tests/test_a.py::test_x" },
+    cwd = "/home/me/proj",
+    env = { OUT = "/tmp/nvim.me/x/6" },
+  }, s, "/tmp/nvim.me/x", "/tmp/dcn/1", function(p) return p == "/plugins/neotest-python/neotest.py" end)
+  local hash = vim.fn.sha256("/plugins/neotest-python"):sub(1, 12)
+  eq(run.copy_in, { { host = "/plugins/neotest-python", remote = "/tmp/dcn/1/in/" .. hash } })
+  eq(run.cwd, "/home/me/proj")
+  local cmd = table.concat(run.command, " ")
+  assert(cmd:find("exec -it -u vscode -w /workspaces/proj -e OUT=/tmp/dcn/1/tmp/6", 1, true), cmd)
+  assert(cmd:find("python3 /tmp/dcn/1/in/" .. hash .. "/neotest.py --results-file /tmp/dcn/1/tmp/5 -- /workspaces/proj/tests/test_a.py::test_x", 1, true), cmd)
+end)
+
+test("terminal providers: builtin fallback, snacks, toggleterm, function", function()
+  local terminal = require("devcontainer.terminal")
+  config.set({ terminal = { provider = "snacks" } })
+  eq(terminal.provider(), "builtin", "snacks not installed")
+  local calls = {}
+  _G.Snacks = { terminal = { open = function(argv, o) table.insert(calls, { "snacks", argv, o.cwd }); return { buf = vim.api.nvim_create_buf(false, true) } end } }
+  terminal.open({ "a", "b c" }, { cwd = "/x" })
+  eq(calls[1], { "snacks", { "a", "b c" }, "/x" })
+  package.loaded["toggleterm.terminal"] = { Terminal = { new = function(_, o)
+    table.insert(calls, { "toggleterm", o.cmd, o.dir })
+    return { toggle = function() end }
+  end } }
+  config.set({ terminal = { provider = "toggleterm" } })
+  terminal.open({ "a", "b c" }, { cwd = "/x" })
+  eq(calls[2], { "toggleterm", "'a' 'b c'", "/x" })
+  config.set({ terminal = { provider = function(argv) table.insert(calls, { "fn", argv }) end } })
+  terminal.open({ "z" })
+  eq(calls[3], { "fn", { "z" } })
+  _G.Snacks, package.loaded["toggleterm.terminal"] = nil, nil
+  config.set({})
+end)
+
+-- progress, templates, picker, git ------------------------------------------------------------
+
+test("progress.parse_line: CLI json/text, BuildKit and classic steps", function()
+  local progress = require("devcontainer.progress")
+  eq({ progress.parse_line('{"type":"text","level":2,"text":"Start: Run: docker build"}') }, { "Start: Run: docker build" })
+  eq({ progress.parse_line("[1234 ms] Resolving features") }, { "Resolving features" })
+  eq({ progress.parse_line("#8 [build 3/4] RUN apt-get install -y cmake") }, { "[build 3/4] RUN apt-get install -y cmake", 75 })
+  eq({ progress.parse_line("Step 1/2 : FROM ubuntu") }, { "Step 1/2 : FROM ubuntu", 50 })
+  eq(progress.parse_line("#8 0.312 Reading package lists..."), nil)
+  eq(progress.parse_line('{"outcome":"success","containerId":"x"}'), nil)
+  eq(progress.parse_line("   "), nil)
+end)
+
+test("progress backends: fidget, snacks, echo, off", function()
+  local progress = require("devcontainer.progress")
+  local calls = {}
+  package.loaded["fidget.progress.handle"] = { create = function(m)
+    table.insert(calls, { "create", m.title })
+    return { report = function(_, p) table.insert(calls, { "report", p.message, p.percentage }) end,
+      finish = function() table.insert(calls, { "finish" }) end }
+  end }
+  config.set({})
+  eq(progress.backend(), "fidget")
+  local p = progress.start("dc")
+  p:feed({ "#3 [2/4] RUN make", "noise" })
+  p:finish(true, "attached")
+  vim.wait(500, function() return #calls >= 4 end)
+  eq(calls[1], { "create", "dc" })
+  eq(calls[2], { "report", "attached", nil }, "throttled updates superseded by the final message")
+  eq(calls[#calls], { "finish" })
+  package.loaded["fidget.progress.handle"] = nil
+  eq(progress.backend(), "echo")
+  config.set({ progress = false })
+  eq(progress.backend(), nil)
+  progress.start("x"):report("nothing happens")
+  config.set({})
+end)
+
+test("templates: refs and the minimal config", function()
+  local templates = require("devcontainer.templates")
+  eq(templates.template_ref("cpp"), "ghcr.io/devcontainers/templates/cpp")
+  eq(templates.template_ref("ghcr.io/me/t/x:1"), "ghcr.io/me/t/x:1")
+  local conf = jsonc.decode(templates.minimal_config("proj", "base:ubuntu"))
+  eq(conf, { name = "proj", image = "mcr.microsoft.com/devcontainers/base:ubuntu" })
+  eq(jsonc.decode(templates.minimal_config("p", "ghcr.io/x/y:1")).image, "ghcr.io/x/y:1")
+end)
+
+test("picker: backend selection and argv", function()
+  local picker = require("devcontainer.picker")
+  config.set({ picker = "telescope" })
+  eq(picker.backend(), "telescope")
+  config.set({})
+  eq(picker.backend(), "select")
+  local s = fake_session({})
+  local argv = picker.list_argv(s, "/usr/include")
+  eq({ argv[#argv - 4], argv[#argv] }, { "/bin/sh", "/usr/include" })
+  eq(picker.buffer_name(s, "/usr/include/stdio.h"), "devcontainer://0123456789ab/usr/include/stdio.h")
+end)
+
+test("git: dotfiles url, CLI flags, SSH agent mount", function()
+  local git = require("devcontainer.git")
+  eq(git.dotfiles_url("me/dotfiles"), "https://github.com/me/dotfiles.git")
+  eq(git.dotfiles_url("me/dotfiles.git"), "https://github.com/me/dotfiles.git")
+  eq(git.dotfiles_url("git@host:me/d.git"), "git@host:me/d.git")
+  eq(git.cli_dotfiles_args({ dotfiles = { repository = "me/d", target_path = "~/d", install_command = "i.sh" } }),
+    { "--dotfiles-repository", "https://github.com/me/d.git", "--dotfiles-target-path", "~/d", "--dotfiles-install-command", "i.sh" })
+  eq(git.cli_dotfiles_args({ dotfiles = {} }), {})
+  eq(git.agent_mount({ git = { ssh_agent = false } }), nil)
+  eq(git.agent_mount({ git = { ssh_agent = true } }, true), "type=bind,source=/run/host-services/ssh-auth.sock,target=" .. git.AGENT_SOCK)
+  local linux = git.agent_mount({ git = { ssh_agent = true } }, false)
+  eq(linux, ("type=bind,source=%s,target=%s"):format(git.host_agent_dir(), git.AGENT_DIR))
+  local docker = require("devcontainer.backend.docker")
+  local args = table.concat(docker.run_args({ docker = "docker", local_folder = "/p", remote_folder = "/w", options = config.options }, {}, "img", { "a", "b" }), " ")
+  assert(args:find("SSH_AUTH_SOCK=" .. git.AGENT_SOCK, 1, true), args)
+end)
+
+test("git: dotfiles script clones, runs the install script / links dotfiles once", function()
+  local git = require("devcontainer.git")
+  local home, repo = tmp .. "/dot-home", tmp .. "/dot-repo"
+  vim.fn.mkdir(home, "p")
+  writef(repo .. "/.vimrc", "set nocp\n")
+  writef(repo .. "/.git-keep", "")
+  vim.system({ "sh", "-c", 'cd "$1" && git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x', "sh", repo }):wait()
+  local function run(target, cmd)
+    return vim.system({ "sh", "-c", git.DOTFILES_SCRIPT, "sh", repo, target, cmd or "" }, { env = { HOME = home } }):wait()
+  end
+  eq(run("~/dotfiles").code, 0)
+  eq(vim.uv.fs_readlink(home .. "/.vimrc"), home .. "/dotfiles/.vimrc", "no install script: dotfiles linked")
+  writef(repo .. "/install.sh", '#!/bin/sh\ntouch "$HOME/installed"\n')
+  vim.system({ "sh", "-c", 'cd "$1" && git add -A && git -c user.email=a@b -c user.name=t commit -qm y', "sh", repo }):wait()
+  eq(run("~/dot2").code, 0)
+  eq(vim.uv.fs_stat(home .. "/installed") ~= nil, true, "install.sh ran")
+  eq(run("~/dot3", "touch \"$HOME/custom\"").code, 0)
+  eq(vim.uv.fs_stat(home .. "/custom") ~= nil, true, "install command ran")
+  vim.fn.delete(home .. "/custom")
+  eq(run("~/dot3", "touch \"$HOME/custom\"").code, 0)
+  eq(vim.uv.fs_stat(home .. "/custom"), nil, "only installed once")
+end)
+
+test("git: SSH agent relay forwards to $SSH_AUTH_SOCK", function()
+  local git = require("devcontainer.git")
+  local upstream = tmp .. "/agent-upstream.sock"
+  local server = vim.uv.new_pipe(false)
+  assert(server:bind(upstream))
+  server:listen(4, function()
+    local c = vim.uv.new_pipe(false)
+    server:accept(c)
+    c:read_start(function(_, d) if d then c:write("agent:" .. d) else c:close() end end)
+  end)
+  local orig = vim.env.SSH_AUTH_SOCK
+  vim.env.SSH_AUTH_SOCK = upstream
+  eq(git.start_agent_relay(), true)
+  local got
+  local client = vim.uv.new_pipe(false)
+  client:connect(git.host_agent_dir() .. "/agent.sock", function(err)
+    assert(not err, err)
+    client:read_start(function(_, d) if d then got = (got or "") .. d end end)
+    client:write("hello")
+  end)
+  vim.wait(3000, function() return got == "agent:hello" end)
+  eq(got, "agent:hello")
+  client:close()
+  git.stop_agent_relay()
+  server:close()
+  vim.env.SSH_AUTH_SOCK = orig
+end)
+
+test("lsp.start_clients: a newer move takes over the clients of the pending one", function()
+  local stopped = false
+  local client = { id = 4242, is_stopped = function() return stopped end, stop = function() end }
+  local buf = scratch_named("/moves/w/a.c")
+  local calls = {}
+  local orig = vim.lsp.start
+  vim.lsp.start = function(cfg, o) table.insert(calls, { cfg.name, o.bufnr }) end
+  local entry = { client = client, config = { name = "srv", cmd = { vim.fn.exepath("sh") } }, bufs = { buf } }
+  local after = 0
+  lsp.start_clients({ entry }, function() after = after + 1 end, "/moves/w") -- e.g. up
+  lsp.start_clients({}, nil, "/moves/w") -- e.g. stop right after: takes the client over
+  stopped = true
+  vim.wait(1000, function() return #calls > 0 end)
+  vim.wait(300)
+  vim.lsp.start = orig
+  eq(calls, { { "srv", buf } }, "started once")
+  eq(after, 0, "the superseded move's callback doesn't run")
 end)
 
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))

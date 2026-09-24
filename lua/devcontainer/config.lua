@@ -14,14 +14,69 @@ M.defaults = {
   --   "ask" = offer to start it (answers "always"/"never" are remembered per project)
   --   true  = start it right away, false = only on :Devcontainer up
   autostart = "ask",
-  -- `docker stop` attached containers when Neovim exits
+  -- `docker stop` attached containers when Neovim exits (compose projects are stopped as a
+  -- whole; devcontainer.json `"shutdownAction": "none"` keeps a container running)
   stop_on_exit = false,
+  -- offer to rebuild when devcontainer.json / its Dockerfile / compose files change
+  watch_config = true,
   -- how to capture the container user's environment (PATH from nvm/sdkman/...):
   -- nil = devcontainer.json `userEnvProbe` (default "loginInteractiveShell"), or
   -- "none" | "loginShell" | "interactiveShell" | "loginInteractiveShell"
   user_env_probe = nil,
   -- open container-only files (system headers, SDKs, toolchains) as devcontainer:// buffers
   remote_fs = true,
+  -- which config to use when the workspace has several (.devcontainer/<name>/devcontainer.json):
+  -- nil = ask, or the <name> (usually set by a profile)
+  devcontainer = nil,
+  -- named sets of option overrides, see :help devcontainer-profiles
+  --   { asan = { desc = "...", match = { "~/work/**" }, extends = { "base" }, project = { ... } } }
+  profiles = {},
+  -- read customizations["devcontainer.nvim"] (settings / profiles shared by the team) from
+  -- devcontainer.json; the file has to be trusted first (:help vim.secure.read)
+  customizations = true,
+  git = {
+    -- make the host's SSH agent available in new containers (SSH_AUTH_SOCK), see :help devcontainer-git
+    ssh_agent = true,
+    -- copy ~/.gitconfig into the container when it has none: true | false | path of the file to copy
+    gitconfig = true,
+  },
+  dotfiles = {
+    -- "owner/repo" (GitHub) or any git URL, cloned into new containers
+    repository = nil,
+    target_path = "~/dotfiles",
+    -- default: the first of install.sh, install, bootstrap.sh, bootstrap, setup.sh, setup; without
+    -- one, the repository's dotfiles are linked into $HOME
+    install_command = nil,
+  },
+  -- progress of :Devcontainer up (image build, lifecycle hooks):
+  -- "auto" (fidget.nvim, else snacks.nvim's notifier when enabled, else echo) | "fidget" | "snacks" | "echo" | false
+  progress = "auto",
+  -- picker for :Devcontainer files: "auto" (snacks.picker, telescope, fzf-lua, else vim.ui.select)
+  -- | "snacks" | "telescope" | "fzf-lua" | "select"
+  picker = "auto",
+  files = {
+    -- folders offered by :Devcontainer files without an argument (globs; ~ = remote user's home)
+    roots = {
+      "/usr/include", "/usr/local/include", "/opt",
+      "~/.cargo/registry/src", "~/.rustup/toolchains",
+      "/usr/lib/python3*/site-packages", "/usr/local/lib/python3*/site-packages", "~/.local/lib/python3*/site-packages",
+      "/usr/local/go/src", "~/go/pkg/mod", "/usr/local/lib/node_modules", "/usr/lib/jvm",
+    },
+  },
+  terminal = {
+    -- where :Devcontainer shell / exec and `run` tasks open: "builtin" (a split) | "snacks" |
+    -- "toggleterm" | fun(argv, { cwd, env, title, height, on_exit })
+    provider = "builtin",
+  },
+  ports = {
+    -- forward devcontainer.json `forwardPorts` when attaching (:Devcontainer forward for others)
+    forward = true,
+    -- host address of the forwarded ports
+    bind_address = "127.0.0.1",
+    -- fun(host, port, session) -> argv run in the container for each connection
+    -- (default: the first of socat, bash, python3, nc found in the container)
+    relay = nil,
+  },
   lsp = {
     enabled = true,
     -- "*" = every server whose root_dir lies inside an attached devcontainer; or a list of names
@@ -42,8 +97,15 @@ M.defaults = {
     output_height = 12,
     -- open the quickfix list when a task fails with parsed errors
     open_quickfix = true,
+    -- environment of every project task (build, test, run)
+    env = {},
+    -- default program arguments for :Devcontainer run / debug without `-- args`
+    run_args = {},
     cmake = {
-      -- used when the project has no CMakePresets.json; relative to the project root
+      -- configure preset to use (default: the one picked with :Devcontainer select, else the first)
+      preset = nil,
+      -- used when the project has no CMakePresets.json; relative to the project root.
+      -- Macros: ${buildType}, ${presetName}, ${profile} (the selected profile, "default" without)
       build_dir = "build/${buildType}",
       build_type = "Debug",
       build_types = { "Debug", "Release", "RelWithDebInfo", "MinSizeRel" },
@@ -58,6 +120,8 @@ M.defaults = {
     },
     cargo = {
       profile = "dev", -- "dev" | "release" | any custom profile
+      features = {}, -- --features a,b
+      no_default_features = false,
       build_args = {},
       test_args = {},
     },
@@ -81,26 +145,53 @@ M.defaults = {
 ---@type devcontainer.Options
 M.options = vim.deepcopy(M.defaults)
 
-function M.set(opts)
-  M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.defaults), opts or {})
-  -- lists should replace, not merge index-by-index
-  if opts and opts.lsp then
-    for _, k in ipairs({ "servers", "exclude" }) do
-      if opts.lsp[k] ~= nil then
-        M.options.lsp[k] = opts.lsp[k]
+local function is_list(t)
+  return type(t) == "table" and next(t) ~= nil and vim.islist(t)
+end
+
+--- Deep merge of option tables. Lists replace the base list; with `append_args`, lists under
+--- keys ending in "_args" (configure_args, build_args, ...) are appended instead, which is how
+--- profiles add flags on top of the base options.
+---@param base table
+---@param override table
+---@param append_args? boolean
+function M.merge(base, override, append_args)
+  local out = vim.deepcopy(base)
+  for k, v in pairs(override) do
+    local b = out[k]
+    if type(v) == "table" and type(b) == "table" and not getmetatable(v) then
+      if is_list(v) or is_list(b) then
+        if append_args and type(k) == "string" and k:match("_args$") then
+          out[k] = vim.list_extend(vim.deepcopy(b), v)
+        else
+          out[k] = vim.deepcopy(v)
+        end
+      else
+        out[k] = M.merge(b, v, append_args)
       end
+    else
+      out[k] = type(v) == "table" and vim.deepcopy(v) or v
     end
   end
-  local p = opts and opts.project or {}
-  for _, section in ipairs({ "cmake", "cargo", "debug" }) do
-    for k, v in pairs(p[section] or {}) do
-      if vim.islist(v) then M.options.project[section][k] = v end
-    end
-  end
+  return out
+end
+
+--- Options that apply to `path` (a project or workspace root): the global options with the
+--- matching / selected profiles and the devcontainer.json customizations applied.
+---@param path? string
+---@return devcontainer.Options
+function M.get(path)
+  if not path then return M.options end
+  return require("devcontainer.profiles").resolve(path)
+end
+
+function M.set(opts)
+  M.options = M.merge(M.defaults, opts or {})
   local o = M.options
   if o.docker == "docker" and vim.fn.executable("docker") == 0 and vim.fn.executable("podman") == 1 then
     o.docker = "podman"
   end
+  require("devcontainer.profiles").invalidate()
 end
 
 return M

@@ -38,6 +38,12 @@ function M.get(root)
   return vim.deepcopy(load().projects[root] or {})
 end
 
+--- One top-level value of a project, without copying (read only; cheap enough for statuslines).
+function M.peek(root, key)
+  local t = load().projects[root]
+  return t and t[key]
+end
+
 --- Set `key` (dot separated: "cmake.preset") for a project; nil removes it.
 function M.set(root, key, value)
   local projects = load().projects

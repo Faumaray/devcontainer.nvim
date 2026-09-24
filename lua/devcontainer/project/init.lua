@@ -48,7 +48,9 @@ M.register(require("devcontainer.project.cargo"))
 ---@field provider devcontainer.Provider
 ---@field session? devcontainer.Session
 ---@field state table                     persisted choices (preset, profile, target, ...)
----@field opts table                      config.options.project[provider]
+---@field options devcontainer.Options     options for this project (profiles applied)
+---@field opts table                      options.project[provider]
+---@field profile? string                 selected profile (see devcontainer.profiles)
 local Ctx = {}
 Ctx.__index = Ctx
 
@@ -74,6 +76,8 @@ end
 function Ctx:task(t)
   t.cwd = t.cwd or self.root
   t.session = self.session or false
+  local env = self.options and self.options.project.env
+  if env and next(env) then t.env = vim.tbl_extend("force", {}, env, t.env or {}) end
   return t
 end
 
@@ -105,7 +109,9 @@ function M.detect(path)
   if not best then return nil end
   best.session = registry.find(best.root)
   best.state = store.get(best.root)[best.provider.name] or {}
-  best.opts = config.options.project[best.provider.name] or {}
+  best.options = config.get(best.root)
+  best.opts = best.options.project[best.provider.name] or {}
+  best.profile = require("devcontainer.profiles").describe(best.root).selected
   return setmetatable(best, Ctx)
 end
 
@@ -143,7 +149,7 @@ end
 
 --- Launch configuration for nvim-dap, paths in host space (the DAP proxy maps them).
 local function dap_config(ctx, exe, args)
-  local dbg = config.options.project.debug
+  local dbg = ctx.options.project.debug
   local function host(p) return p and (ctx:host_path(p) or p) end
   return vim.tbl_extend("force", {
     type = dbg.adapter,
@@ -155,8 +161,8 @@ local function dap_config(ctx, exe, args)
   }, dbg.config or {})
 end
 
-local function ensure_adapter(dap)
-  local dbg = config.options.project.debug
+local function ensure_adapter(dap, ctx)
+  local dbg = ctx.options.project.debug
   if not dap.adapters[dbg.adapter] then
     dap.adapters[dbg.adapter] = require("devcontainer.dap").adapter({
       command = dbg.command[1],
@@ -173,7 +179,7 @@ function M.debug(ctx, args)
   if not exe then return end
   local steps = ctx.provider.build_target(ctx, exe.name)
   table.insert(steps, function(cb)
-    ensure_adapter(dap)
+    ensure_adapter(dap, ctx)
     dap.run(dap_config(ctx, exe, args.extra))
     cb(true)
   end)
@@ -212,6 +218,9 @@ function M.action(name, argstr)
   local ctx = M.detect()
   if not ctx then return log.warn("no CMake or Cargo project around " .. start_path()) end
   local args = M.parse_args(name, argstr)
+  if (name == "run" or name == "debug") and #args.extra == 0 then
+    args.extra = vim.deepcopy(ctx.options.project.run_args or {})
+  end
   async.run(function()
     local steps
     if name == "debug" then
@@ -269,6 +278,7 @@ function M.describe()
   if not ctx then return nil end
   local where = ctx.session and ("in " .. ctx.session.name) or "on the host"
   local detail = ctx.provider.describe and ctx.provider.describe(ctx) or ""
+  if ctx.profile then detail = ("profile %s%s"):format(ctx.profile, detail ~= "" and (", " .. detail) or "") end
   return ("%s project %s%s — runs %s"):format(ctx.provider.name, ctx.root, detail ~= "" and (" (" .. detail .. ")") or "", where)
 end
 

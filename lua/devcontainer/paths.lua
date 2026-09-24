@@ -50,6 +50,23 @@ local function walk(v, key, fn)
   return copy or v
 end
 
+--- Replace every occurrence of the folder `from` in `s` by `to`, but only whole paths:
+--- "/ws/proj/a.cpp:3" and "--dir=/ws/proj" match, "/ws/project2" and "/x/ws/proj" don't.
+function M.replace_root(s, from, to)
+  if from == to or not s:find(from, 1, true) then return s end
+  local out, i = {}, 1
+  while true do
+    local b, e = s:find(from, i, true)
+    if not b then break end
+    local prev, nxt = s:sub(b - 1, b - 1), s:sub(e + 1, e + 1)
+    local whole = (prev == "" or not prev:match("[%w_.%-/]")) and (nxt == "" or not nxt:match("[%w_.%-]"))
+    out[#out + 1] = s:sub(i, b - 1) .. (whole and to or from)
+    i = e + 1
+  end
+  out[#out + 1] = s:sub(i)
+  return table.concat(out)
+end
+
 ---@class devcontainer.Translator
 local Translator = {}
 Translator.__index = Translator

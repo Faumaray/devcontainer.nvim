@@ -8,10 +8,32 @@ function M.normalize_dir(p)
   return (p:gsub("(.)/+$", "%1"))
 end
 
---- Workspace root = folder containing .devcontainer/ or .devcontainer.json
+--- Workspace root = nearest folder with a devcontainer config (.devcontainer.json,
+--- .devcontainer/devcontainer.json or .devcontainer/<name>/devcontainer.json). A .devcontainer/
+--- folder without a config in it (just a Dockerfile, say) doesn't count.
 function M.find_root(path)
-  local root = vim.fs.root(path, { ".devcontainer.json", ".devcontainer" })
+  local root = vim.fs.root(path, function(name, dir)
+    if name == ".devcontainer.json" then return true end
+    return name == ".devcontainer" and #M.list_configs(dir) > 0
+  end)
   return root and M.normalize_dir(root)
+end
+
+local root_cache = {}
+local ROOT_CACHE_MS = 2000
+
+--- find_root with a short-lived cache, for callers that run on every redraw (statuslines).
+function M.find_root_cached(path)
+  local now = vim.uv.now()
+  local hit = root_cache[path]
+  if hit and now - hit.time < ROOT_CACHE_MS then return hit.root or nil end
+  local root = M.find_root(path)
+  root_cache[path] = { root = root or false, time = now }
+  return root
+end
+
+function M.clear_cache()
+  root_cache = {}
 end
 
 function M.list_configs(root)
@@ -79,6 +101,34 @@ function M.load(config_file, local_folder)
   ctx.remote_folder = explicit and M.substitute(raw.workspaceFolder, ctx)
     or ("/workspaces/" .. vim.fs.basename(local_folder))
   return M.substitute(raw, ctx), ctx.remote_folder, explicit
+end
+
+--- Files that define the container: devcontainer.json, its Dockerfile, its compose files.
+---@return string[]
+function M.config_files(config_file, conf)
+  local dir = vim.fs.dirname(config_file)
+  local function abs(p) return vim.fs.normalize(p:sub(1, 1) == "/" and p or (dir .. "/" .. p)) end
+  local files = { config_file }
+  local build = type(conf.build) == "table" and conf.build or {}
+  local dockerfile = build.dockerfile or conf.dockerFile
+  if type(dockerfile) == "string" then table.insert(files, abs(dockerfile)) end
+  local compose = conf.dockerComposeFile
+  for _, f in ipairs(type(compose) == "string" and { compose } or type(compose) == "table" and compose or {}) do
+    if type(f) == "string" then table.insert(files, abs(f)) end
+  end
+  return files
+end
+
+--- Hash of the files that define the container, to notice that it needs a rebuild.
+function M.fingerprint(config_file, conf)
+  local parts = {}
+  for _, f in ipairs(M.config_files(config_file, conf)) do
+    local fd = io.open(f, "rb")
+    local data = fd and fd:read("*a") or ""
+    if fd then fd:close() end
+    parts[#parts + 1] = f .. "\31" .. data:gsub("%z", "")
+  end
+  return vim.fn.sha256(table.concat(parts, "\30")):sub(1, 16)
 end
 
 --- Lifecycle command (string | string[] | { name = cmd }) -> list of argv

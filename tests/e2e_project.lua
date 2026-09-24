@@ -134,6 +134,24 @@ check("cmake: compile_commands.json linked for clangd",
 check("cmake: compile database has container paths", (read(CM .. "/compile_commands.json") or ""):find(CM_REMOTE .. "/src/main.cpp", 1, true) ~= nil)
 check("cmake: targets for completion", vim.tbl_contains(require("devcontainer.project").complete_targets("sgsn"), "sgsn_app"))
 
+-- profiles: the selected profile picks the build dir and adds configure args
+require("devcontainer").add_profiles({
+  asan = { desc = "sanitizers", project = { cmake = { build_dir = "build/${profile}-${buildType}", configure_args = { "-DDC_PROFILE=asan" } } } },
+})
+vim.cmd("Devcontainer profile asan")
+check("profile: statusline shows it", require("devcontainer").statusline() == "cm [asan]", require("devcontainer").statusline())
+res = run("Devcontainer build")
+log = read(E .. "/docker.log") or ""
+check("profile: build configured the profile's build dir with its args", res.ok == true
+  and log:find('"build/asan%-Debug"[^\n]*"%-DDC_PROFILE=asan"') ~= nil and res.name == "cmake build (Debug, asan)", res)
+check("profile: compile_commands.json follows the profile", vim.uv.fs_readlink(CM .. "/compile_commands.json") == "build/asan-Debug/compile_commands.json")
+vim.cmd("Devcontainer profile none")
+local n_configure = select(2, log:gsub('"cmake", "%-S"', ""))
+res = run("Devcontainer build")
+log = read(E .. "/docker.log") or ""
+check("profile: back to the default build dir without reconfiguring", res.ok == true
+  and select(2, log:gsub('"cmake", "%-S"', "")) == n_configure and log:find('"cmake", "--build", "build/Debug"', #log - 2000, true) ~= nil)
+
 write(CM .. "/src/main.cpp", 'int main() {\n  int x = "not an int";\n  return x;\n}\n')
 res = run("Devcontainer build")
 check("cmake: broken build fails", res.ok == false, res)

@@ -77,8 +77,17 @@ end
 
 --- Listen on 127.0.0.1:<random>; on the first connection spawn `argv` (a docker exec command)
 --- and pump translated DAP messages between the socket and the adapter's stdio.
+---@param opts? { on_close?: fun() }  called once when the debug session is over (or never started)
 ---@return integer port
-function M.proxy(session, argv)
+function M.proxy(session, argv, opts)
+  local on_close = opts and opts.on_close
+  local function closed()
+    if on_close then
+      local f = on_close
+      on_close = nil
+      pcall(f)
+    end
+  end
   local server = assert(uv.new_tcp())
   assert(server:bind("127.0.0.1", 0))
   local port = server:getsockname().port
@@ -115,6 +124,7 @@ function M.proxy(session, argv)
     local function shutdown()
       if done then return end
       done = true
+      closed()
       close(stdin)
       close(stdout)
       close(stderr)
@@ -175,6 +185,7 @@ function M.proxy(session, argv)
       close(timer)
       close(server)
       log.append("dap proxy: nvim-dap never connected")
+      closed()
     end
   end)
 
@@ -189,12 +200,86 @@ local function pick_session(cfg)
   return registry.current()
 end
 
---- nvim-dap adapter that runs `spec.command` inside the devcontainer of the debugged project
---- (falls back to running it on the host when there is none).
----@param spec { command: string, args?: string[], options?: table, id?: string, enrich_config?: function }
+local function resolve_cmd(session, command)
+  return session:which(command) or (command:find("/", 1, true) and session:which(vim.fs.basename(command))) or nil
+end
+
+--- A TCP ("server") adapter such as codelldb or delve: start it in the container, wait until it
+--- listens, and hand nvim-dap the local proxy whose upstream is a relay to the adapter's port.
+local function server_adapter(spec, session, callback)
+  local ports = require("devcontainer.ports")
+  local exe = spec.executable or {}
+  if not exe.command then
+    return log.error("devcontainer.dap: server adapters need `executable = { command = ..., args = ... }`")
+  end
+  local cmd = resolve_cmd(session, exe.command)
+  if not cmd then return log.error(("%s not found in container %s"):format(exe.command, session.name)) end
+  local port = tonumber(spec.port) or (20000 + vim.uv.hrtime() % 20000)
+  local args = vim.tbl_map(function(a)
+    return type(a) == "string" and (a:gsub("%${port}", tostring(port))) or a
+  end, exe.args or {})
+  local relay = ports.relay_for(session, "127.0.0.1", port)
+  if not relay then return log.error("devcontainer.dap: the container has none of " .. table.concat(ports.RELAYS, ", ")) end
+
+  local exited = false
+  local adapter = vim.system(session:exec_argv(vim.list_extend({ cmd }, args), {
+    cwd = exe.cwd and (session:remote_path(exe.cwd) or exe.cwd) or nil,
+  }), {
+    stdout = function(_, data) if data then log.append(data) end end,
+    stderr = function(_, data) if data then log.append(data) end end,
+  }, function(res)
+    exited = true
+    log.append(("debug adapter %s exited with code %d"):format(exe.command, res.code))
+  end)
+  session.dap_procs = session.dap_procs or {}
+  session.dap_procs[adapter] = true
+  local function stop_adapter()
+    session.dap_procs[adapter] = nil
+    if not exited then pcall(adapter.kill, adapter, 15) end
+  end
+
+  -- poll until the adapter listens (not by connecting: it only accepts one client)
+  local probe = session:exec_argv(ports.listening_argv(port), { env = false })
+  local deadline = vim.uv.now() + 10000
+  local function poll()
+    if exited then return log.error(("debug adapter %s exited before listening (see :Devcontainer log)"):format(exe.command)) end
+    vim.system(probe, {}, vim.schedule_wrap(function(res)
+      if res.code ~= 0 then
+        if vim.uv.now() > deadline then
+          stop_adapter()
+          return log.error(("debug adapter %s did not listen on port %d"):format(exe.command, port))
+        end
+        return vim.defer_fn(poll, 100)
+      end
+      local ok, proxy_port = pcall(M.proxy, session, session:exec_argv(relay, { stdin = true, env = false }), { on_close = stop_adapter })
+      if not ok then
+        stop_adapter()
+        return log.error("devcontainer.dap: " .. tostring(proxy_port))
+      end
+      callback({
+        type = "server",
+        host = "127.0.0.1",
+        port = proxy_port,
+        id = spec.id,
+        enrich_config = spec.enrich_config,
+        options = spec.options,
+      })
+    end))
+  end
+  poll()
+end
+
+--- nvim-dap adapter that runs inside the devcontainer of the debugged project (and unchanged on
+--- the host when there is none). Stdio adapters: `{ command, args?, options?, id? }`. TCP adapters
+--- (codelldb, delve): `{ type = "server", port = "${port}", executable = { command, args } }`.
+---@param spec { type?: string, command?: string, args?: string[], port?: string|integer, executable?: table, options?: table, id?: string, enrich_config?: function }
 function M.adapter(spec)
   if spec.type == "server" then
-    error("devcontainer.dap: only stdio (executable) adapters are supported — use gdb -i dap or lldb-dap", 2)
+    return function(callback, cfg)
+      local session = pick_session(cfg)
+      if not session then return callback(spec) end
+      server_adapter(spec, session, callback)
+    end
   end
   return function(callback, cfg)
     local session = pick_session(cfg)
@@ -205,8 +290,7 @@ function M.adapter(spec)
     local env, cwd = options.env, options.cwd
     options.env, options.cwd, options.detached = nil, nil, nil
 
-    local cmd = session:which(spec.command)
-      or (spec.command:find("/", 1, true) and session:which(vim.fs.basename(spec.command)))
+    local cmd = resolve_cmd(session, spec.command)
     if not cmd then
       log.error(("%s not found in container %s"):format(spec.command, session.name))
       return
