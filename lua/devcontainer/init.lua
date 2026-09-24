@@ -169,6 +169,7 @@ function M.up(opts)
   emit("DevcontainerStarting", { local_folder = root })
 
   local progress, unsubscribe
+  local entries = {} -- clients stopped to move them; started again wherever they belong now
   async.run(function()
     local o = config.get(root)
     local configs = spec.list_configs(root)
@@ -178,14 +179,9 @@ function M.up(opts)
     local conf, remote_folder, explicit = spec.load(config_file, root)
     if not conf then error(remote_folder, 0) end
 
-    local entries = {}
     local existing = registry.by_folder(root)
-    if existing then
-      if not opts.rebuild and existing.config_file == config_file and is_running(existing) then
-        return log.info(("already attached to %s (%s)"):format(existing.name, existing.key))
-      end
-      entries = lsp.stop_clients(root, existing.key)
-      M._teardown(existing)
+    if existing and not opts.rebuild and existing.config_file == config_file and is_running(existing) then
+      return log.info(("already attached to %s (%s)"):format(existing.name, existing.key))
     end
 
     -- the container predates changes to devcontainer.json / Dockerfile: offer to rebuild it
@@ -199,6 +195,11 @@ function M.up(opts)
       })
       if not choice then return end
       opts.rebuild = choice == "Rebuild the container"
+    end
+
+    if existing then
+      entries = lsp.stop_clients(root, existing.key)
+      M._teardown(existing)
     end
 
     local backend_name, backend = pick_backend(o)
@@ -275,7 +276,11 @@ function M.up(opts)
     busy[root] = nil
     if unsubscribe then unsubscribe() end
     if progress then progress:finish(not err, err and "failed" or "attached") end
-    if err then log.error("devcontainer: " .. tostring(err)) end
+    if err then
+      log.error("devcontainer: " .. tostring(err))
+      -- nothing attached: the clients stopped for the move go back to the host
+      if not registry.by_folder(root) then lsp.start_clients(entries) end
+    end
   end)
 end
 
