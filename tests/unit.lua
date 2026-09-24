@@ -193,7 +193,11 @@ test("lsp.cmd helper: host-less servers still move into the container", function
   eq(new._devcontainer_key, s.key)
   eq(new._devcontainer_host_cmd, { "clangd", "--background-index" })
   session_mod.unregister(s)
-  eq(lsp.rewrite({ name = "clangd", cmd = fn, root_dir = "/home/me/proj" }).cmd, fn)
+  -- detached: the host command when the host has it, else nothing (no spawn error)
+  local missing = lsp.cmd({ "definitely-not-on-this-host" })
+  eq(lsp.rewrite({ name = "clangd", cmd = missing, root_dir = "/home/me/proj" }), nil)
+  local on_host = lsp.cmd({ vim.fn.exepath("sh") })
+  eq(lsp.rewrite({ name = "clangd", cmd = on_host, root_dir = "/home/me/proj" }).cmd, on_host)
 end)
 
 local dap = require("devcontainer.dap")
@@ -870,6 +874,25 @@ test("git: SSH agent relay forwards to $SSH_AUTH_SOCK", function()
   git.stop_agent_relay()
   server:close()
   vim.env.SSH_AUTH_SOCK = orig
+end)
+
+test("lsp.start_clients: a newer move takes over the clients of the pending one", function()
+  local stopped = false
+  local client = { id = 4242, is_stopped = function() return stopped end, stop = function() end }
+  local buf = scratch_named("/moves/w/a.c")
+  local calls = {}
+  local orig = vim.lsp.start
+  vim.lsp.start = function(cfg, o) table.insert(calls, { cfg.name, o.bufnr }) end
+  local entry = { client = client, config = { name = "srv", cmd = { vim.fn.exepath("sh") } }, bufs = { buf } }
+  local after = 0
+  lsp.start_clients({ entry }, function() after = after + 1 end, "/moves/w") -- e.g. up
+  lsp.start_clients({}, nil, "/moves/w") -- e.g. stop right after: takes the client over
+  stopped = true
+  vim.wait(1000, function() return #calls > 0 end)
+  vim.wait(300)
+  vim.lsp.start = orig
+  eq(calls, { { "srv", buf } }, "started once")
+  eq(after, 0, "the superseded move's callback doesn't run")
 end)
 
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))

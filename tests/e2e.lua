@@ -465,7 +465,10 @@ if session then
     return c and c.config._devcontainer_key == session.key and c.initialized
   end))
   loc = definition(3, 20)
-  check("cli: definitions still map to host paths", loc and loc.uri == vim.uri_from_fname(HOST .. "/util.h"), loc)
+  check("cli: definitions still map to host paths", loc and loc.uri == vim.uri_from_fname(HOST .. "/util.h"), loc
+    or vim.tbl_map(function(c) -- which client didn't answer
+      return { c.id, c.name, c.config._devcontainer_key, initialized = c.initialized, stopped = c:is_stopped() }
+    end, vim.lsp.get_clients({ bufnr = main_buf })))
 end
 
 -- 10. :Devcontainer down removes the container -------------------------------------------------

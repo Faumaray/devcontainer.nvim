@@ -279,7 +279,7 @@ function M.up(opts)
     if err then
       log.error("devcontainer: " .. tostring(err))
       -- nothing attached: the clients stopped for the move go back to the host
-      if not registry.by_folder(root) then lsp.start_clients(entries) end
+      if not registry.by_folder(root) then lsp.start_clients(entries, nil, root) end
     end
   end)
 end
@@ -305,7 +305,7 @@ function M._stop(s)
     if err then return log.error("stop failed: " .. tostring(err)) end
     log.info(s.name .. " stopped")
   end)
-  lsp.start_clients(entries)
+  lsp.start_clients(entries, nil, s.local_folder)
 end
 
 --- Remove the container of the current workspace (docker compose down for compose configs).
@@ -324,7 +324,7 @@ function M.down(opts)
         if err then return log.error("remove failed: " .. tostring(err)) end
         log.info(s.name .. " removed")
       end)
-      lsp.start_clients(entries)
+      lsp.start_clients(entries, nil, s.local_folder)
     end
     if opts and opts.confirm == false then return remove() end
     vim.ui.select({ "Remove", "Cancel" }, {

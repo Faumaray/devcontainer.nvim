@@ -306,23 +306,51 @@ function M.stop_clients(folder, key)
   return entries
 end
 
+-- folder -> the move in progress: its clients are still exiting
+local moves = {}
+
 --- Wait (≤3s) for the stopped clients to exit, then start them again for their buffers.
 --- Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
+---
+--- One move per workspace: a newer one (stop right after up, up with another backend, ...) takes
+--- over the clients of the one still waiting, instead of both starting them when their timers fire.
 ---@param entries devcontainer.LspEntry[]
 ---@param after? fun()  called once the clients have been started again
-function M.start_clients(entries, after)
+---@param folder? string  workspace the move belongs to
+function M.start_clients(entries, after, folder)
+  local previous = folder and moves[folder]
+  if previous then
+    previous.cancel()
+    local seen = {}
+    for _, e in ipairs(entries) do seen[e.client.id] = true end
+    for _, e in ipairs(previous.entries) do
+      if not seen[e.client.id] then
+        seen[e.client.id] = true
+        entries[#entries + 1] = e
+      end
+    end
+  end
   if #entries == 0 then
     if after then after() end
     return
   end
   local timer = assert(vim.uv.new_timer())
+  local move = { entries = entries }
+  function move.cancel()
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    if folder and moves[folder] == move then moves[folder] = nil end
+  end
+  if folder then moves[folder] = move end
   local waited = 0
   timer:start(0, 100, vim.schedule_wrap(function()
+    if timer:is_closing() then return end
     waited = waited + 100
     local pending = vim.tbl_filter(function(e) return not e.client:is_stopped() end, entries)
     if #pending > 0 and waited < 3000 then return end
-    timer:stop()
-    timer:close()
+    move.cancel()
     for _, e in ipairs(pending) do e.client:stop(true) end
 
     for _, e in ipairs(entries) do
@@ -389,7 +417,7 @@ function M.restart(folder, entries)
     if not seen[e.client.id] then entries[#entries + 1] = e end
   end
   M.adopt()
-  M.start_clients(entries, function() M.retrigger(folder) end)
+  M.start_clients(entries, function() M.retrigger(folder) end, folder)
 end
 
 return M
