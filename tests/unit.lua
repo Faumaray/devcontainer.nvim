@@ -565,5 +565,50 @@ test("cargo: features and custom profile flags", function()
   eq(cargo.actions[4].run(ctx, { extra = {} })[1].cmd, { "cargo", "test", "--profile", "ci", "--features", "a,b", "--no-default-features" })
 end)
 
+-- ports ----------------------------------------------------------------------------------------
+
+local ports = require("devcontainer.ports")
+test("ports.parse: forwardPorts + portsAttributes", function()
+  local specs = ports.parse({
+    forwardPorts = { 3000, "db:5432", "8080", "bogus" },
+    portsAttributes = {
+      ["3000"] = { label = "Web", onAutoForward = "openBrowser", protocol = "https" },
+      ["5000-6000"] = { label = "Range", requireLocalPort = true },
+    },
+    otherPortsAttributes = { onAutoForward = "silent" },
+  })
+  eq(#specs, 3)
+  eq(specs[1], { host = "localhost", port = 3000, label = "Web", on_auto_forward = "openBrowser", require_local_port = false, protocol = "https" })
+  eq(specs[2], { host = "db", port = 5432, label = "Range", on_auto_forward = "notify", require_local_port = true })
+  eq(specs[3].on_auto_forward, "silent")
+  eq({ ports.parse_arg("db:5432") }, { "db", 5432 })
+  eq({ ports.parse_arg(" 3000 ") }, { "localhost", 3000 })
+  eq(ports.parse_arg("x"), nil)
+end)
+
+test("ports: relay and readiness argv", function()
+  eq(ports.relay_argv("socat", "db", 5432), { "socat", "-", "TCP:db:5432" })
+  eq(ports.relay_argv("nc", "localhost", 80, "/bin/nc"), { "/bin/nc", "localhost", "80" })
+  local bash = ports.relay_argv("bash", "localhost", 80)
+  eq({ bash[1], bash[2], bash[4], bash[5] }, { "bash", "-c", "localhost", "80" })
+  local s = fake_session({ python3 = "/usr/bin/python3" })
+  local argv, kind = ports.relay_for(s, "localhost", 1)
+  eq({ argv[1], kind }, { "/usr/bin/python3", "python3" })
+  eq(ports.relay_for(fake_session({}), "localhost", 1), nil)
+  eq(ports.listening_argv(8080)[4], "8080")
+  local res = vim.system({ "sh", "-c", ports.listening_argv(1)[3], "1" }):wait()
+  eq(res.code ~= 0, true, "nothing listens on port 1")
+end)
+
+test("docker backend: appPort published, forwardPorts tunnelled instead", function()
+  local docker = require("devcontainer.backend.docker")
+  local args = docker.run_args({ docker = "docker", local_folder = "/p", remote_folder = "/w" },
+    { forwardPorts = { 3000 }, appPort = { 8000, "9000:9001" } }, "img", { "l1", "l2" })
+  local s = table.concat(args, " ")
+  eq(s:find("3000", 1, true), nil)
+  assert(s:find("-p 127.0.0.1:8000:8000", 1, true), s)
+  assert(s:find("-p 9000:9001", 1, true), s)
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

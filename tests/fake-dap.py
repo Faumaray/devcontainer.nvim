@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
-"""Tiny stdio debug adapter: answers initialize/launch/stackTrace/disconnect and asks the client
+"""Tiny debug adapter (stdio, or TCP with --port N): answers initialize/launch/stackTrace/disconnect and asks the client
 to runInTerminal, so tests/e2e.lua can check the proxy's path translation."""
 import json
 import os
 import sys
 
 inp, out = sys.stdin.buffer, sys.stdout.buffer
+if "--port" in sys.argv:
+    # server mode (like codelldb / delve): speak DAP over one TCP connection
+    import socket
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])))
+    srv.listen(1)
+    print("listening", flush=True)
+    conn, _ = srv.accept()
+    inp, out = conn.makefile("rb"), conn.makefile("wb")
 seq = 0
 
 

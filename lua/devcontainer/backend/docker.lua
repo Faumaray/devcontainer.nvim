@@ -68,7 +68,8 @@ local function build_image(ctx, conf, opts)
   return tag
 end
 
-local function create(ctx, conf, image, labels)
+--- `docker run` argv for a new container (pure, for tests).
+function M.run_args(ctx, conf, image, labels)
   local args = { ctx.docker, "run", "-d", "--label", labels[1], "--label", labels[2] }
   local mount = conf.workspaceMount
     or ("type=bind,source=%s,target=%s"):format(ctx.local_folder, ctx.remote_folder)
@@ -80,8 +81,14 @@ local function create(ctx, conf, image, labels)
     end
     vim.list_extend(args, { "--mount", m })
   end
-  for _, port in ipairs(conf.forwardPorts or {}) do
-    if type(port) == "number" then vim.list_extend(args, { "-p", ("127.0.0.1:%d:%d"):format(port, port) }) end
+  -- appPort is published; forwardPorts are tunnelled after attach (devcontainer.ports)
+  local app = conf.appPort
+  for _, port in ipairs(type(app) == "table" and app or app and { app } or {}) do
+    if type(port) == "number" then
+      vim.list_extend(args, { "-p", ("127.0.0.1:%d:%d"):format(port, port) })
+    elseif type(port) == "string" then
+      vim.list_extend(args, { "-p", port })
+    end
   end
   if conf.containerUser then vim.list_extend(args, { "-u", conf.containerUser }) end
   if conf.privileged then table.insert(args, "--privileged") end
@@ -97,6 +104,11 @@ local function create(ctx, conf, image, labels)
   else
     table.insert(args, image)
   end
+  return args
+end
+
+local function create(ctx, conf, image, labels)
+  local args = M.run_args(ctx, conf, image, labels)
   log.info("creating container from " .. image)
   local res = async.check(args, { text = true })
   return vim.trim(res.stdout)

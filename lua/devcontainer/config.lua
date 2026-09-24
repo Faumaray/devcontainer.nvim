@@ -34,6 +34,15 @@ M.defaults = {
   -- read customizations["devcontainer.nvim"] (settings / profiles shared by the team) from
   -- devcontainer.json; the file has to be trusted first (:help vim.secure.read)
   customizations = true,
+  ports = {
+    -- forward devcontainer.json `forwardPorts` when attaching (:Devcontainer forward for others)
+    forward = true,
+    -- host address of the forwarded ports
+    bind_address = "127.0.0.1",
+    -- fun(host, port, session) -> argv run in the container for each connection
+    -- (default: the first of socat, bash, python3, nc found in the container)
+    relay = nil,
+  },
   lsp = {
     enabled = true,
     -- "*" = every server whose root_dir lies inside an attached devcontainer; or a list of names

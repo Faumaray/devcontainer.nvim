@@ -270,6 +270,86 @@ local rit_reply = find(function(m) return m.type == "event" and m.body and m.bod
 check("host pid stripped from runInTerminal response", rit_reply and not rit_reply.body.output:find("4242"), rit_reply)
 send({ type = "request", command = "disconnect", arguments = {} })
 
+-- 7a. TCP (server) adapters like codelldb: started in the container, reached through a relay ---
+local tcp_resolved
+require("devcontainer").dap_adapter({
+  type = "server", port = "${port}",
+  executable = { command = "python3", args = { root .. "/tests/fake-dap.py", "--port", "${port}" } },
+})(function(a) tcp_resolved = a end, { cwd = HOST })
+check("tcp adapter started in the container and proxied", wait(15000, function() return tcp_resolved ~= nil end)
+  and tcp_resolved.type == "server" and tcp_resolved.port > 0, tcp_resolved)
+if tcp_resolved then
+  local tmsgs, tconnected = {}, false
+  local tfeed = dap.framer(function(body) table.insert(tmsgs, vim.json.decode(body)) end)
+  local tsock = vim.uv.new_tcp()
+  tsock:connect("127.0.0.1", tcp_resolved.port, function(err)
+    assert(not err, err)
+    tconnected = true
+    tsock:read_start(function(_, data) if data then tfeed(data) end end)
+  end)
+  wait(5000, function() return tconnected end)
+  tsock:write(dap.frame(vim.json.encode({ seq = 1, type = "request", command = "initialize", arguments = {} })))
+  tsock:write(dap.frame(vim.json.encode({ seq = 2, type = "request", command = "launch",
+    arguments = { program = HOST .. "/build/app", cwd = HOST } })))
+  local tseen
+  wait(10000, function()
+    for _, m in ipairs(tmsgs) do
+      if m.type == "event" and m.body and m.body.category == "seen" then tseen = vim.json.decode(m.body.output) end
+    end
+    return tseen ~= nil
+  end)
+  check("tcp adapter got container paths", tseen and tseen.args.program == REMOTE .. "/build/app" and tseen.cwd == REMOTE, tseen)
+  tsock:write(dap.frame(vim.json.encode({ seq = 3, type = "request", command = "disconnect", arguments = {} })))
+  tsock:close()
+end
+
+-- 7d. port forwarding ----------------------------------------------------------------------------
+local ports = require("devcontainer.ports")
+local echo_port
+-- a server "in the container" (same network as the host in this fake), bound to a port that is
+-- therefore also taken on the host: the forward has to pick another local port
+local echo = vim.system({ "python3", "-c", [[
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(5)
+print(s.getsockname()[1], flush=True)
+while True:
+    c, _ = s.accept()
+    c.sendall(b"echo:" + c.recv(1024))
+    c.close()
+]] }, { stdout = function(_, d) if d and not echo_port then echo_port = tonumber(d:match("%d+")) end end })
+wait(5000, function() return echo_port ~= nil end)
+local function roundtrip(local_port)
+  local got, c = nil, vim.uv.new_tcp()
+  c:connect("127.0.0.1", local_port, function(err)
+    if err then got = "connect: " .. err return end
+    c:read_start(function(_, d)
+      if d then got = (got or "") .. d else c:close() end
+    end)
+    c:write("hi")
+  end)
+  wait(10000, function() return got == "echo:hi" end)
+  return got
+end
+for _, kind in ipairs({ "bash", "python3" }) do
+  require("devcontainer.config").options.ports.relay = function(h, p) return ports.relay_argv(kind, h, p) end
+  require("devcontainer.profiles").invalidate()
+  vim.cmd("Devcontainer forward " .. echo_port)
+  local fwd
+  for _, f in ipairs(ports.list(session)) do
+    if f.port == echo_port then fwd = f end
+  end
+  check(kind .. " relay: forwarded to another local port", fwd and fwd.local_port ~= echo_port, fwd)
+  if fwd then check(kind .. " relay: data goes through the container", roundtrip(fwd.local_port) == "echo:hi") end
+  vim.cmd("Devcontainer unforward " .. echo_port)
+  check(kind .. " relay: unforward stops it", #vim.tbl_filter(function(f) return f.port == echo_port end, ports.list(session)) == 0)
+end
+require("devcontainer.config").options.ports.relay = nil
+require("devcontainer.profiles").invalidate()
+echo:kill(9)
+
 -- 7b. :Devcontainer exec -----------------------------------------------------------------------
 vim.cmd.buffer(main_buf)
 vim.cmd("Devcontainer exec echo hi-from-$PWD")

@@ -124,6 +124,8 @@ end
 --- Forget a session: unregister it and wipe its (unmodified) devcontainer:// buffers.
 function M._teardown(session)
   registry.unregister(session)
+  require("devcontainer.ports").stop_all(session)
+  for proc in pairs(session.dap_procs or {}) do pcall(proc.kill, proc, 15) end
   local prefix = "devcontainer://" .. session.key .. "/"
   for _, buf in ipairs(vim.api.nvim_list_bufs()) do
     if vim.startswith(vim.api.nvim_buf_get_name(buf), prefix) and not vim.bo[buf].modified then
@@ -232,6 +234,7 @@ function M.up(opts)
       if type(cmd) == "table" and type(cmd[1]) == "string" then vim.list_extend(bins, { cmd[1], vim.fs.basename(cmd[1]) }) end
     end
     table.insert(bins, o.project.debug.command[1])
+    vim.list_extend(bins, require("devcontainer.ports").RELAYS)
     session:prefetch(bins)
 
     -- lifecycle hooks (the devcontainer CLI runs these itself)
@@ -251,6 +254,7 @@ function M.up(opts)
     log.info(("attached to %s: %s -> %s"):format(session.name, root, session.remote_folder))
     lsp.restart(root, entries)
     reload_unread(session)
+    require("devcontainer.ports").start(session)
     emit("DevcontainerAttached", event_data(session))
 
     -- postAttachCommand runs on every attach and is left to the tool, even with the CLI
@@ -316,6 +320,63 @@ function M.down(opts)
   end, "Remove devcontainer")
 end
 
+--- Forwarded ports of the current devcontainer: open one in the browser, copy its address or
+--- stop forwarding it.
+function M.ports()
+  local ports = require("devcontainer.ports")
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    local list = ports.list(s)
+    if #list == 0 then return log.info("no forwarded ports (:Devcontainer forward <port>)") end
+    vim.ui.select(list, { prompt = "Ports of " .. s.name, format_item = ports.describe }, function(fwd)
+      if not fwd then return end
+      local actions = { "Open in browser", "Copy address" }
+      if not fwd.published then table.insert(actions, "Stop forwarding") end
+      vim.ui.select(actions, { prompt = ports.describe(fwd) }, function(action)
+        if action == "Open in browser" then
+          vim.ui.open(ports.url(fwd))
+        elseif action == "Copy address" then
+          vim.fn.setreg("+", ("localhost:%d"):format(fwd.local_port))
+          vim.fn.setreg('"', ("localhost:%d"):format(fwd.local_port))
+          log.info(("copied localhost:%d"):format(fwd.local_port))
+        elseif action == "Stop forwarding" then
+          ports.unforward(s, fwd.port, fwd.host)
+        end
+      end)
+    end)
+  end, "Devcontainer")
+end
+
+--- Forward a container port: "3000", "db:5432", optionally followed by the local port.
+function M.forward(arg)
+  local ports = require("devcontainer.ports")
+  local target, local_port = vim.trim(arg or ""):match("^(%S+)%s*(%d*)$")
+  local host, port = ports.parse_arg(target)
+  if not port then return log.warn("usage: :Devcontainer forward <port | host:port> [local port]") end
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    local fwd, err = ports.forward(s, {
+      host = host, port = port, local_port = tonumber(local_port), on_auto_forward = "notify",
+      require_local_port = local_port ~= "",
+    })
+    if not fwd then return log.error(err) end
+    log.info("forwarding " .. ports.describe(fwd))
+  end, "Devcontainer")
+end
+
+--- Stop forwarding a container port.
+function M.unforward(arg)
+  local ports = require("devcontainer.ports")
+  local host, port = ports.parse_arg(arg)
+  if not port then return log.warn("usage: :Devcontainer unforward <port | host:port>") end
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached") end
+    if not ports.unforward(s, port, arg:find(":", 1, true) and host or nil) then
+      log.warn(("port %d is not forwarded"):format(port))
+    end
+  end, "Devcontainer")
+end
+
 --- Open the devcontainer.json of the current workspace.
 function M.open_config()
   local s = registry.current()
@@ -355,10 +416,12 @@ function M.info()
     for _, c in ipairs(vim.lsp.get_clients()) do
       if c.config._devcontainer_key == s.key then clients[#clients + 1] = c.name end
     end
+    local ports = vim.tbl_map(require("devcontainer.ports").describe, require("devcontainer.ports").list(s))
     vim.list_extend(lines, {
       ("%s  [%s, %s backend]"):format(s.name, s.key, s.backend),
       ("  %s -> %s%s"):format(s.local_folder, s.remote_folder, s.remote_user and (" as " .. s.remote_user) or ""),
       ("  LSP in container: %s"):format(#clients > 0 and table.concat(clients, ", ") or "-"),
+      ("  ports: %s"):format(#ports > 0 and table.concat(ports, ", ") or "-"),
     })
   end
   if #lines == 0 then

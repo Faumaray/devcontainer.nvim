@@ -17,6 +17,22 @@ local subcommands = {
   stop = { fn = function() dc().stop() end },
   down = { fn = function() dc().down() end },
   config = { fn = function() dc().open_config() end },
+  ports = { fn = function() dc().ports() end },
+  forward = {
+    fn = function(args) dc().forward(args) end,
+    complete = function()
+      local s = dc().get()
+      return s and vim.tbl_map(function(p) return p.host == "localhost" and tostring(p.port) or (p.host .. ":" .. p.port) end,
+        require("devcontainer.ports").parse(s.config or {})) or {}
+    end,
+  },
+  unforward = {
+    fn = function(args) dc().unforward(args) end,
+    complete = function()
+      local s = dc().get()
+      return s and vim.tbl_map(function(f) return tostring(f.port) end, require("devcontainer.ports").list(s)) or {}
+    end,
+  },
   exec = { fn = function(args) dc().exec(args) end },
   shell = { fn = function() dc().exec() end },
   log = { fn = function() require("devcontainer.log").open() end },
