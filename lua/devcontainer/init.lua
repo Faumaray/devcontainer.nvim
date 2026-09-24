@@ -545,8 +545,13 @@ function M.profile(name)
     end
     log.info(("profile for %s: %s"):format(vim.fn.fnamemodify(scope, ":~"), choice or "default"))
     local s = registry.by_folder(scope)
+    local lsp_changed = not vim.deep_equal(before.lsp, after.lsp)
+    if not lsp_changed then
+      -- servers following the build dir move to the new profile's database (if it's configured)
+      require("devcontainer.lsp").refresh_compile_commands(scope)
+    end
     if s then
-      if not vim.deep_equal(before.lsp, after.lsp) then require("devcontainer.lsp").restart(s.local_folder) end
+      if lsp_changed then require("devcontainer.lsp").restart(s.local_folder) end
       for _, k in ipairs({ "devcontainer", "backend", "docker", "cli_up_args", "git", "dotfiles" }) do
         if not vim.deep_equal(before[k], after[k]) then
           log.warn("the profile changes container settings: run :Devcontainer rebuild to apply them")

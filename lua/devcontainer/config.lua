@@ -87,6 +87,10 @@ M.defaults = {
     remote_cmd = {},
     -- server binary missing in the container: "local" = run it on the host (with a warning), "none" = don't start
     fallback = "local",
+    -- a server told where compile_commands.json is (clangd --compile-commands-dir=build, or
+    -- init_options.compilationDatabasePath) follows the project's active build dir (build/Debug,
+    -- the dir of the selected profile / preset); false keeps what the config says
+    follow_build_dir = true,
   },
   -- :Devcontainer configure/build/run/test/clean/debug — run in the container when attached, else on the host
   project = {

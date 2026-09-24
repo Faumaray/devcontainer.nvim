@@ -892,7 +892,85 @@ test("lsp.start_clients: a newer move takes over the clients of the pending one"
   vim.wait(300)
   vim.lsp.start = orig
   eq(calls, { { "srv", buf } }, "started once")
-  eq(after, 0, "the superseded move's callback doesn't run")
+  eq(after, 1, "the superseded move's callback runs once, after the merged move")
+end)
+
+test("lsp: --compile-commands-dir / compilationDatabasePath follow the active build dir", function()
+  local root = tmp .. "/ccd"
+  writef(root .. "/CMakeLists.txt", "")
+  config.set({})
+  local cfg = { name = "clangd", cmd = { "clangd", "--compile-commands-dir=build", "--background-index" }, root_dir = root }
+  local argv, _, cdb = lsp.remap_compile_commands(cfg.cmd, cfg)
+  eq(argv, { "clangd", "--compile-commands-dir=" .. root .. "/build/Debug", "--background-index" })
+  eq(cdb, { dir = root .. "/build/Debug", ready = false })
+  eq(cfg.cmd[2], "--compile-commands-dir=build", "config untouched")
+  writef(root .. "/build/Debug/compile_commands.json", "[]")
+  eq(select(3, lsp.remap_compile_commands(cfg.cmd, cfg)).ready, true)
+  eq(lsp.remap_compile_commands({ "clangd", "--compile-commands-dir", "build" }, cfg)[3], root .. "/build/Debug")
+  eq(lsp.remap_compile_commands({ "clangd", "--compile-commands-dir=" .. root .. "/build" }, cfg)[2],
+    "--compile-commands-dir=" .. root .. "/build/Debug", "absolute dir inside the project")
+  local _, io = lsp.remap_compile_commands({ "clangd" },
+    vim.tbl_extend("force", cfg, { init_options = { compilationDatabasePath = "build", fallbackFlags = {} } }))
+  eq(io, { compilationDatabasePath = root .. "/build/Debug", fallbackFlags = {} })
+  local elsewhere = { "clangd", "--compile-commands-dir=/opt/elsewhere" }
+  eq(lsp.remap_compile_commands(elsewhere, cfg), elsewhere, "a dir outside the project is kept")
+  local plain = { "clangd" }
+  eq(lsp.remap_compile_commands(plain, cfg), plain)
+
+  config.set({ profiles = { p = { project = { cmake = { build_dir = "build/${profile}-${buildType}" } } } } })
+  profiles.set(root, "p")
+  eq(lsp.remap_compile_commands(cfg.cmd, cfg)[2], "--compile-commands-dir=" .. root .. "/build/p-Debug", "profile build dir")
+  profiles.set(root, nil)
+  config.set({ lsp = { follow_build_dir = false } })
+  eq(lsp.remap_compile_commands(cfg.cmd, cfg), cfg.cmd, "follow_build_dir = false")
+  config.set({})
+end)
+
+test("lsp.rewrite: the container argv names the build dir in container paths", function()
+  local root = tmp .. "/ccd"
+  local s = session_mod.new({ container_id = "abcdef0123456789", local_folder = root, remote_folder = "/workspaces/ccd", docker = "docker" })
+  s.which = function(_, b) return b == "clangd" and "/usr/bin/clangd" or nil end
+  session_mod.register(s)
+  local new = lsp.rewrite({ name = "clangd", cmd = { "clangd", "--compile-commands-dir=build" }, root_dir = root })
+  eq(new._devcontainer_argv, { "/usr/bin/clangd", "--compile-commands-dir=/workspaces/ccd/build/Debug" })
+  eq(new._devcontainer_cdb, { dir = root .. "/build/Debug", ready = true })
+  eq(new._devcontainer_host_cmd, { "clangd", "--compile-commands-dir=build" }, "restarts recompute from the original")
+  config.set({ lsp = { remote_cmd = { clangd = { "clangd-18", "--compile-commands-dir=build" } } } })
+  new = lsp.rewrite({ name = "clangd", cmd = { "clangd" }, root_dir = root })
+  eq(new._devcontainer_argv, { "clangd-18", "--compile-commands-dir=/workspaces/ccd/build/Debug" }, "remote_cmd too")
+  eq(new._devcontainer_cdb.dir, root .. "/build/Debug")
+  config.set({ lsp = { remote_cmd = { clangd = { "clangd-18", "--compile-commands-dir=/workspaces/ccd/build" } } } })
+  new = lsp.rewrite({ name = "clangd", cmd = { "clangd" }, root_dir = root })
+  eq(new._devcontainer_argv, { "clangd-18", "--compile-commands-dir=/workspaces/ccd/build/Debug" }, "container path in remote_cmd")
+  config.set({ lsp = { remote_cmd = { clangd = { "clangd-18", "--compile-commands-dir=/opt/db" } } } })
+  new = lsp.rewrite({ name = "clangd", cmd = { "clangd" }, root_dir = root })
+  eq(new._devcontainer_argv, { "clangd-18", "--compile-commands-dir=/opt/db" }, "outside the project: kept")
+  config.set({})
+  session_mod.unregister(s)
+  local host = lsp.rewrite({ name = "clangd", cmd = { vim.fn.exepath("sh"), "--compile-commands-dir=build" }, root_dir = root })
+  eq(host.cmd, { vim.fn.exepath("sh"), "--compile-commands-dir=" .. root .. "/build/Debug" }, "on the host too")
+end)
+
+test("lsp.refresh_compile_commands restarts only servers whose database moved or appeared", function()
+  local root = tmp .. "/ccd"
+  local function client(id, cdb)
+    return { id = id, config = { root_dir = root, _devcontainer_cdb = cdb }, attached_buffers = {},
+      is_stopped = function() return false end, stop = function() end }
+  end
+  local current = root .. "/build/Debug" -- has compile_commands.json (previous test)
+  local clients = {
+    client(1, { dir = current, ready = true }), -- up to date
+    client(2, { dir = current, ready = false }), -- started before the first configure
+    client(3, { dir = root .. "/build/Release", ready = true }), -- another profile / build type
+    client(4, nil), -- doesn't follow the build dir
+  }
+  local orig_get, orig_start = vim.lsp.get_clients, lsp.start_clients
+  local restarted
+  vim.lsp.get_clients = function() return clients end
+  lsp.start_clients = function(entries) restarted = vim.tbl_map(function(e) return e.client.id end, entries) end
+  lsp.refresh_compile_commands(root)
+  vim.lsp.get_clients, lsp.start_clients = orig_get, orig_start
+  eq(restarted, { 2, 3 })
 end)
 
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))

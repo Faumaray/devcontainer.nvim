@@ -401,12 +401,13 @@ M.actions = {
   },
 }
 
---- After configure: remember the configuration, link compile_commands.json for clangd.
-function M.after(ctx, action)
-  if action ~= "configure" then return end
-  local r = M.resolve(ctx)
-  if r.host_build then store.set(ctx.root, "cmake_configured." .. build_id(r), M.configure_key(ctx, r)) end
-  if not ctx.opts.link_compile_commands then return end
+--- Host path of the build dir whose compile_commands.json clangd should use (the active one).
+function M.compile_commands_dir(ctx)
+  return M.resolve(ctx).host_build
+end
+
+--- Symlink <build>/compile_commands.json into the project root (never over the user's own file).
+local function link_compile_commands(ctx, r)
   local db = r.host_build and (r.host_build .. "/compile_commands.json")
   if not db or not vim.uv.fs_stat(db) or not vim.startswith(r.host_build, ctx.root .. "/") then return end
   local link = ctx.root .. "/compile_commands.json"
@@ -418,6 +419,16 @@ function M.after(ctx, action)
     vim.uv.fs_unlink(link)
   end
   vim.uv.fs_symlink(target, link)
+end
+
+--- After configure: remember the configuration, link compile_commands.json for clangd, and move
+--- servers pointed at the build dir (--compile-commands-dir) to the new database.
+function M.after(ctx, action)
+  if action ~= "configure" then return end
+  local r = M.resolve(ctx)
+  if r.host_build then store.set(ctx.root, "cmake_configured." .. build_id(r), M.configure_key(ctx, r)) end
+  if ctx.opts.link_compile_commands then link_compile_commands(ctx, r) end
+  require("devcontainer.lsp").refresh_compile_commands(ctx.root)
 end
 
 function M.settings(ctx)

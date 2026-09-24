@@ -148,6 +148,10 @@ lsp                                                *devcontainer-option-lsp*
                           or a function(host_cmd, session) returning argv
     fallback = "local"    server missing in the container: "local" runs it
                           on the host (with a warning), "none" doesn't
+    follow_build_dir = true
+                          `--compile-commands-dir` / `compilationDatabasePath`
+                          follow the active build dir, see
+                          |devcontainer-compile-commands|
 
 project                                        *devcontainer-option-project*
     runner = "auto"       "auto" (overseer.nvim when installed),
@@ -316,6 +320,17 @@ wrapped: >lua
 <
 Absolute host paths (mason's bin folder) are looked up by name in the
 container; workspace paths in arguments are rewritten.
+
+                                               *devcontainer-compile-commands*
+A server told where compile_commands.json is, like clangd with
+`--compile-commands-dir=build` or `init_options.compilationDatabasePath`, gets
+the active build dir of its CMake project instead: `build/Debug`, or the dir
+of the selected profile or preset (container path in the container). It
+restarts when that dir changes (profile, preset or build type switch) and
+after the first configure of a build dir. Relative dirs and dirs inside the
+project are followed; others are kept. `lsp.follow_build_dir = false` keeps
+what the config says. Without the argument clangd finds the
+compile_commands.json that is symlinked into the project root.
 
 ==============================================================================
 7. CONTAINER-ONLY FILES                              *devcontainer-remote-fs*
