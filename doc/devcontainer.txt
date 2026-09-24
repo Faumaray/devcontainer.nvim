@@ -1,0 +1,532 @@
+*devcontainer.txt*   VS Code-style devcontainers for Neovim
+
+Author:  faumaray
+License: MIT
+
+==============================================================================
+CONTENTS                                              *devcontainer-contents*
+
+  1. Introduction ............................ |devcontainer-intro|
+  2. Setup ................................... |devcontainer-setup|
+  3. Options ................................. |devcontainer-options|
+  4. Commands ................................ |devcontainer-commands|
+  5. Profiles ................................ |devcontainer-profiles|
+  6. Language servers ........................ |devcontainer-lsp|
+  7. Container-only files .................... |devcontainer-remote-fs|
+  8. Projects: CMake and Cargo ............... |devcontainer-projects|
+  9. Debugging ............................... |devcontainer-dap|
+ 10. Port forwarding ......................... |devcontainer-ports|
+ 11. Git, SSH agent and dotfiles ............. |devcontainer-git|
+ 12. Integrations ............................ |devcontainer-integrations|
+ 13. Events .................................. |devcontainer-events|
+ 14. Lua API ................................. |devcontainer-api|
+ 15. Health .................................. |devcontainer-health|
+ 16. Limitations ............................. |devcontainer-limitations|
+
+==============================================================================
+1. INTRODUCTION                                          *devcontainer-intro*
+
+Neovim runs on your host; language servers, debug adapters, formatters,
+linters, tests and builds run inside the container described by the
+project's `.devcontainer/devcontainer.json`. Your editor, config and plugins
+stay local, the toolchain lives in the container. Paths are translated in
+both directions: /home/me/proj/a.cpp on the host is /workspaces/proj/a.cpp in
+the container.
+
+The workspace is the nearest folder containing `.devcontainer.json`,
+`.devcontainer/devcontainer.json` or `.devcontainer/<name>/devcontainer.json`.
+
+Requirements: Neovim 0.11 or later, docker or podman. The devcontainer CLI
+(`npm install -g @devcontainers/cli`) is recommended: it adds features,
+docker compose, UID remapping and the complete lifecycle. Without it a
+built-in backend handles `image` and `build` configs.
+
+==============================================================================
+2. SETUP                                                 *devcontainer-setup*
+
+Load the plugin before the first language server starts (lazy.nvim: >lua
+    { "faumaray/devcontainer.nvim", lazy = false, opts = {} }
+<
+or call it yourself: >lua
+    require("devcontainer").setup({})
+<
+When you open a file (or `:cd`) inside a workspace you are asked whether to
+start its container; "always" and "never" answers are remembered per project
+(|devcontainer-option-autostart|). `:Devcontainer init` adds a configuration
+to a project that has none.
+
+==============================================================================
+3. OPTIONS                                             *devcontainer-options*
+
+Pass options to `setup()`. The defaults:
+
+backend = "auto"                              *devcontainer-option-backend*
+    "auto" uses the devcontainer CLI when installed, else docker. Or force
+    "cli" / "docker".
+
+docker = "docker"                              *devcontainer-option-docker*
+    Container engine. "podman" is picked when docker is missing.
+
+cli = "devcontainer"                              *devcontainer-option-cli*
+    Path of the devcontainer CLI.
+
+cli_up_args = {}                          *devcontainer-option-cli_up_args*
+    Extra arguments for `devcontainer up`.
+
+autostart = "ask"                            *devcontainer-option-autostart*
+    Opening a project with a devcontainer config: "ask" offers to start it,
+    true starts it, false only on `:Devcontainer up`.
+
+stop_on_exit = false                      *devcontainer-option-stop_on_exit*
+    Stop attached containers when Neovim exits. Compose projects are stopped
+    as a whole; `"shutdownAction": "none"` in devcontainer.json keeps one
+    running.
+
+watch_config = true                       *devcontainer-option-watch_config*
+    Offer a rebuild when devcontainer.json, its Dockerfile or compose files
+    are saved, and before reusing a container older than its configuration.
+
+user_env_probe = nil                    *devcontainer-option-user_env_probe*
+    Overrides devcontainer.json `userEnvProbe`: "none", "loginShell",
+    "interactiveShell" or "loginInteractiveShell" (the default).
+
+remote_fs = true                             *devcontainer-option-remote_fs*
+    Open container-only files as `devcontainer://` buffers.
+
+devcontainer = nil                        *devcontainer-option-devcontainer*
+    With several configs (.devcontainer/<name>/devcontainer.json): the
+    <name> to use. nil asks. Usually set by a profile.
+
+profiles = {}                                 *devcontainer-option-profiles*
+    Named option sets, see |devcontainer-profiles|.
+
+customizations = true                   *devcontainer-option-customizations*
+    Read `customizations["devcontainer.nvim"]` from a trusted
+    devcontainer.json, see |devcontainer-customizations|.
+
+git = { ssh_agent = true, gitconfig = true }       *devcontainer-option-git*
+    See |devcontainer-git|. `gitconfig` may also be the path of the file to
+    copy.
+
+dotfiles                                      *devcontainer-option-dotfiles*
+    `{ repository = nil, target_path = "~/dotfiles", install_command = nil }`
+    See |devcontainer-dotfiles|.
+
+progress = "auto"                             *devcontainer-option-progress*
+    Progress of `:Devcontainer up`: "auto" (fidget.nvim, else snacks.nvim's
+    notifier when enabled, else the command line), "fidget", "snacks",
+    "echo" or false.
+
+picker = "auto"                                 *devcontainer-option-picker*
+    Picker of `:Devcontainer files`: "auto" (snacks.picker, telescope,
+    fzf-lua, else |vim.ui.select()|), "snacks", "telescope", "fzf-lua" or
+    "select".
+
+files = { roots = { ... } }                      *devcontainer-option-files*
+    Folders `:Devcontainer files` offers without an argument (globs, `~` is
+    the remote user's home): /usr/include, /usr/local/include, /opt, cargo
+    registry, rustup toolchains, python site-packages, Go sources, global
+    node_modules, /usr/lib/jvm.
+
+terminal = { provider = "builtin" }           *devcontainer-option-terminal*
+    Where `:Devcontainer shell` / `exec` and `run` tasks open: "builtin" (a
+    split), "snacks", "toggleterm", or a function(argv, opts) with opts
+    `{ cwd, env, title, height, on_exit }`.
+
+ports                                            *devcontainer-option-ports*
+    `{ forward = true, bind_address = "127.0.0.1", relay = nil }`
+    See |devcontainer-ports|. `relay` is a function(host, port, session)
+    returning the argv run in the container for each connection.
+
+lsp                                                *devcontainer-option-lsp*
+    enabled = true
+    servers = "*"         "*" or a list of server names to run in the
+                          container
+    exclude = {}          servers that always stay on the host
+    remote_cmd = {}       per-server command in the container, e.g.
+                          `{ clangd = { "clangd-18", "--background-index" } }`
+                          or a function(host_cmd, session) returning argv
+    fallback = "local"    server missing in the container: "local" runs it
+                          on the host (with a warning), "none" doesn't
+
+project                                        *devcontainer-option-project*
+    runner = "auto"       "auto" (overseer.nvim when installed),
+                          "overseer" or "builtin"
+    open_output = "always" builtin output split: "always", "on_failure",
+                          "never"
+    output_height = 12
+    open_quickfix = true  open the quickfix list when a task fails
+    env = {}              environment of every project task
+    run_args = {}         default program arguments of run / debug
+    cmake = {
+      preset = nil,       configure preset (default: :Devcontainer select)
+      build_dir = "build/${buildType}",  without presets; macros
+                          ${buildType}, ${presetName}, ${profile}
+      build_type = "Debug",
+      build_types = { "Debug", "Release", "RelWithDebInfo", "MinSizeRel" },
+      generator = nil,    e.g. "Ninja", for a new build dir
+      configure_args = {}, build_args = {},
+      ctest_args = { "--output-on-failure" },
+      link_compile_commands = true,  symlink compile_commands.json into
+                          the project root
+      run_cwd = "exe",    cwd of run/debug: "exe", "build" or "root"
+    }
+    cargo = { profile = "dev", features = {}, no_default_features = false,
+              build_args = {}, test_args = {} }
+    debug = {
+      adapter = "gdb",    nvim-dap adapter of :Devcontainer debug
+      command = { "gdb", "--interpreter=dap" },
+      config = { stopAtBeginningOfMainSubprogram = false },
+    }
+
+integrations                              *devcontainer-option-integrations*
+    overseer = { wrap_templates = true }  run every overseer template in
+    the container when its cwd is in an attached workspace; or a
+    function(task_defn) returning a boolean.
+
+==============================================================================
+4. COMMANDS                                           *devcontainer-commands*
+
+                                                              *:Devcontainer*
+:Devcontainer [subcommand] [args]     Without a subcommand: `info`.
+
+Container ~
+:Devcontainer up                  Start or attach to the workspace's container
+                                  and move its language servers in.
+:Devcontainer rebuild [--no-cache]
+                                  Remove the container and build it again.
+:Devcontainer stop                Detach and stop the container (the whole
+                                  compose project); servers move back.
+:Devcontainer down                Remove the container (`docker compose down`
+                                  for compose configs), after asking. The
+                                  workspace files are kept.
+:Devcontainer init                Add a devcontainer config to the project
+                                  from a template (|devcontainer-init|).
+:Devcontainer config              Open devcontainer.json.
+:Devcontainer shell               Login shell of the remote user.
+:Devcontainer exec {cmd}          Run {cmd} in the container, in the current
+                                  file's directory.
+:Devcontainer files [dir]         Find and open container-only files.
+:Devcontainer ports               Forwarded ports: open, copy, stop.
+:Devcontainer forward {port} [local]
+                                  Forward a container port; {port} may be
+                                  `host:port` (a compose service).
+:Devcontainer unforward {port}    Stop forwarding a port.
+:Devcontainer profile [name]      Select the workspace's profile; "none"
+                                  for none; without an argument pick one.
+:Devcontainer log                 Build and lifecycle output.
+:Devcontainer info                Attached containers, servers, ports,
+                                  profile and the current project.
+:Devcontainer forget              Forget the "always / never start" answer.
+
+Project (CMake or Cargo, detected from the current file) ~
+:Devcontainer configure [args]    `cmake --preset` / `cmake -S . -B ...`,
+                                  `cargo fetch`
+:Devcontainer build [target] [-- args]
+:Devcontainer run [target] [-- args]
+:Devcontainer test [args]
+:Devcontainer clean
+:Devcontainer debug [target] [-- args]
+                                  Build and start nvim-dap.
+:Devcontainer select              Preset / build type / cargo profile /
+                                  run target.
+:Devcontainer task                Any action, e.g. `fresh`, `clippy`.
+
+Targets complete with <Tab>.
+
+==============================================================================
+5. PROFILES                                           *devcontainer-profiles*
+
+A profile is a named set of option overrides. It applies automatically in
+the folders its `match` fits, or when selected for a workspace with
+`:Devcontainer profile` (remembered per workspace). >lua
+    require("devcontainer").setup({
+      profiles = {
+        asan = {
+          desc = "AddressSanitizer build",
+          project = {
+            cmake = {
+              build_dir = "build/${profile}-${buildType}",
+              configure_args = { "-DCMAKE_CXX_FLAGS=-fsanitize=address" },
+            },
+            env = { ASAN_OPTIONS = "detect_leaks=1" },
+          },
+        },
+        work = {
+          match = { "~/work/**" },
+          extends = "asan",
+          devcontainer = "gpu",
+        },
+      },
+    })
+<
+Profile fields besides options:
+    desc      shown by the picker
+    match     glob, folder (it and everything below), function(root) ->
+              boolean, or a list of those; tested against the project and
+              the workspace folder
+    extends   name or list of names applied first
+
+Precedence, lowest first: `setup()` options, matching profiles (by name),
+devcontainer.json settings, the selected profile. Lists under keys ending in
+`_args` are appended; every other value replaces what's below it.
+
+Selecting a profile clears the project's manual preset / build type / cargo
+profile choices, restarts language servers when their options change, and
+fires |DevcontainerProfileChanged|. CMake reconfigures a build dir whose
+configure settings changed. The statusline shows "name [profile]".
+
+From a project's `.nvim.lua` ('exrc'): >lua
+    require("devcontainer").add_profiles({ ... })
+<
+                                                *devcontainer-customizations*
+devcontainer.json can carry settings and profiles for the whole team: >jsonc
+    "customizations": {
+      "devcontainer.nvim": {
+        "settings": { "project": { "cmake": { "generator": "Ninja" } } },
+        "profiles": { "ci": { "project": { "cmake": {
+          "configure_args": ["-DWERROR=ON"] } } } },
+        "profile": "ci"
+      }
+    }
+<
+They are used once you trust the file (|vim.secure.read()| asks once per
+content). Only `project` (without `debug.command`), `lsp.servers`,
+`lsp.exclude`, `lsp.fallback`, `lsp.remote_cmd`, `ports.forward` and
+`devcontainer` are read: a repository can't choose which programs run on the
+host.
+
+==============================================================================
+6. LANGUAGE SERVERS                                        *devcontainer-lsp*
+
+`vim.lsp.start()` is wrapped. A managed server whose root is inside an
+attached workspace is started with `docker exec -i` and every message is
+translated between host and container paths. Clients already running are
+moved into the container on `up` and back on `stop`.
+
+`vim.lsp.enable()` refuses a config whose `cmd[1]` isn't executable on the
+host. For servers installed only in the container: >lua
+    vim.lsp.config("clangd", {
+      cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" }),
+    })
+<
+Absolute host paths (mason's bin folder) are looked up by name in the
+container; workspace paths in arguments are rewritten.
+
+==============================================================================
+7. CONTAINER-ONLY FILES                              *devcontainer-remote-fs*
+
+Files outside the workspace (system headers, SDKs) open as
+`devcontainer://<id>/<path>` buffers, read and written with `docker exec`.
+Read-only files get 'readonly'. A directory shows a listing: <CR> opens the
+entry under the cursor, `-` the parent. Such buffers restored by a session
+manager before the container runs are read again once it attaches.
+
+`:Devcontainer files [dir]` finds them with a picker
+(|devcontainer-option-picker|).
+
+==============================================================================
+8. PROJECTS: CMAKE AND CARGO                          *devcontainer-projects*
+
+Project commands run in the container when the project's workspace is
+attached, else on the host. Output paths are mapped so the quickfix list
+points at host files (and at `devcontainer://` buffers for container-only
+files).
+
+CMake: CMakePresets.json / CMakeUserPresets.json (with `include` and
+`inherits`) or one build dir per build type. compile_commands.json is
+symlinked into the project root for clangd. Executable targets come from the
+CMake File API.
+
+Cargo: workspaces, binary targets from `cargo metadata`, profiles (custom
+`[profile.*]` sections too) and features.
+
+With overseer.nvim the actions run as overseer tasks (|devcontainer-overseer|).
+`User DevcontainerTaskDone` fires after every task sequence.
+
+==============================================================================
+9. DEBUGGING                                               *devcontainer-dap*
+
+`:Devcontainer debug` builds the target and starts gdb in the container, no
+configuration needed. Wrap your own adapters with |devcontainer.dap_adapter()|:
+they run in the container of the debugged project (on the host without one)
+behind a proxy that translates paths; `runInTerminal` becomes
+`docker exec -it`. >lua
+    local dc = require("devcontainer")
+    dap.adapters.gdb = dc.dap_adapter({ command = "gdb", args = { "-i", "dap" } })
+    dap.adapters["lldb-dap"] = dc.dap_adapter({ command = "lldb-dap" })
+    -- TCP adapters: started in the container, reached through a relay
+    dap.adapters.codelldb = dc.dap_adapter({
+      type = "server", port = "${port}",
+      executable = { command = "codelldb", args = { "--port", "${port}" } },
+    })
+    dap.adapters.go = dc.dap_adapter({
+      type = "server", port = "${port}",
+      executable = { command = "dlv", args = { "dap", "-l", "127.0.0.1:${port}" } },
+    })
+<
+==============================================================================
+10. PORT FORWARDING                                      *devcontainer-ports*
+
+`forwardPorts` of devcontainer.json are forwarded when the container
+attaches, with either backend. Each connection to localhost:<port> is
+relayed into the container through `docker exec` running socat, bash
+(/dev/tcp), python3 or nc, whichever the image has. Servers that listen only
+on the container's localhost work, and so do compose services
+(`"db:5432"`).
+
+`portsAttributes` / `otherPortsAttributes`: `label`, `onAutoForward`
+("notify", "silent", "ignore", "openBrowser", "openBrowserOnce"),
+`requireLocalPort`, `protocol`. When the local port is taken another one is
+used. Ports the container publishes itself (appPort, -p) are listed, not
+tunnelled.
+
+==============================================================================
+11. GIT, SSH AGENT AND DOTFILES                            *devcontainer-git*
+
+SSH agent (`git.ssh_agent`): new containers get SSH_AUTH_SOCK pointing at
+your agent. On Linux, a folder in Neovim's state dir is mounted and Neovim
+serves a socket in it that relays to your current $SSH_AUTH_SOCK, so the
+container still starts after the agent socket moved; the agent is available
+while Neovim runs. The container user needs your uid (the devcontainer CLI
+remaps it). On macOS Docker Desktop's /run/host-services/ssh-auth.sock is
+mounted. Existing containers need a rebuild.
+
+gitconfig (`git.gitconfig`): ~/.gitconfig is copied into containers that
+don't have one.
+
+                                                      *devcontainer-dotfiles*
+Dotfiles (`dotfiles.repository`, "owner/repo" or a git URL): cloned to
+`dotfiles.target_path` in new containers, then `dotfiles.install_command`
+or the first of install.sh, install, bootstrap.sh, bootstrap, setup.sh,
+setup runs; without one the repository's dotfiles are linked into $HOME.
+The CLI backend passes these to `devcontainer up`.
+
+==============================================================================
+12. INTEGRATIONS                                  *devcontainer-integrations*
+
+                                                      *devcontainer-overseer*
+overseer.nvim ~
+Project actions run as overseer tasks and are listed by `:OverseerRun`.
+Every other template (make, just, npm, tasks.json) also runs in the
+container when its cwd is in an attached workspace. Your own tasks opt in
+with the "devcontainer" component.
+
+neotest ~
+>lua
+    require("neotest").setup({ adapters = { ... }, default_strategy = "devcontainer" })
+<
+The adapter's command runs in the container; temporary result files are
+copied back with container paths mapped, helper scripts that exist only on
+the host are copied in first.
+
+conform.nvim ~
+>lua
+    require("devcontainer.integrations.conform").setup()  -- after conform.setup()
+<
+Formatters run in the buffer's container, on the host elsewhere or when the
+tool isn't in the image. `setup({ formatters = { ... }, exclude = { ... } })`
+limits them; `.wrap(name)` wraps one.
+
+nvim-lint ~
+>lua
+    require("devcontainer.integrations.lint").setup()  -- after linters_by_ft
+<
+Linters run in the container; container paths in their output are mapped
+back before the parser sees them.
+
+Terminals ~
+|devcontainer-option-terminal| opens shells and run tasks in snacks.nvim or
+toggleterm. For your own: >lua
+    Snacks.terminal(require("devcontainer").shell_cmd())
+<
+Pickers, progress ~
+|devcontainer-option-picker|, |devcontainer-option-progress|. Every other
+choice goes through |vim.ui.select()|.
+
+Statuslines ~
+lualine: `lualine_x = { "devcontainer" }` (option `profile = false` hides the
+profile). Others: `require("devcontainer").statusline()`, e.g. heirline >lua
+    { provider = function() return require("devcontainer").statusline() end }
+<
+rustaceanvim ~
+>lua
+    vim.g.rustaceanvim = {
+      server = {
+        cmd = function()
+          return require("devcontainer").lsp_cmd({ "rust-analyzer" })
+        end,
+      },
+      tools = {
+        executor = require("devcontainer.integrations.rustaceanvim").executor,
+        test_executor = require("devcontainer.integrations.rustaceanvim").executor,
+      },
+    }
+<
+                                                          *devcontainer-init*
+:Devcontainer init ~
+Pick a template (cpp, rust, python, go, node, java, dotnet, universal, base
+images, or another template / image). With the devcontainer CLI the official
+template is applied (https://containers.dev/templates); without it a minimal
+image config is written.
+
+==============================================================================
+13. EVENTS                                              *devcontainer-events*
+
+`User` autocmds, with |event-data|:
+
+*DevcontainerStarting*        `{ local_folder }`
+*DevcontainerAttached*        `{ name, key, container_id, local_folder,`
+*DevcontainerDetached*          `remote_folder }`
+*DevcontainerProfileChanged*  `{ scope, profile }`
+*DevcontainerTaskDone*        `{ ok, name }` after every task sequence
+
+==============================================================================
+14. LUA API                                                *devcontainer-api*
+
+All in `require("devcontainer")`:
+
+setup({opts})                                         *devcontainer.setup()*
+up({opts})                                               *devcontainer.up()*
+    {opts}: `{ rebuild?, no_cache?, path? }`
+rebuild({opts}), stop(), down({opts})                  *devcontainer.stop()*
+    down: `{ confirm = false }` skips the question.
+get({path})                                             *devcontainer.get()*
+    Session attached to {path} (default: current buffer / cwd), or nil.
+wrap_cmd({argv}, {opts})                           *devcontainer.wrap_cmd()*
+    {argv} wrapped in `docker exec` for the container of {opts}.path
+    (default: current buffer), host paths translated; unchanged (and no
+    session) without one. {opts}: `{ path?, cwd?, env?, tty?, stdin? }`.
+    Returns argv, session.
+shell_cmd({opts})                                 *devcontainer.shell_cmd()*
+    Login shell argv, or nil without a container.
+lsp_cmd({argv})                                     *devcontainer.lsp_cmd()*
+dap_adapter({spec})                             *devcontainer.dap_adapter()*
+profile({name}), options({path}), add_profiles({defs})
+                                                    *devcontainer.profile()*
+forward({arg}), unforward({arg}), ports(), files({dir})
+build(), run(), test(), configure(), clean(), debug(), task(), select()
+statusline({opts})                               *devcontainer.statusline()*
+    "name", "name [profile]" or "name (starting)"; "" without one.
+
+==============================================================================
+15. HEALTH                                              *devcontainer-health*
+
+`:checkhealth devcontainer` checks docker, the CLI, the integrations, the
+profile, the current project's tools and, per attached container, the port
+relay and the SSH agent.
+
+==============================================================================
+16. LIMITATIONS                                    *devcontainer-limitations*
+
+- Stack frames inside container-only files point to host paths in the
+  debugger.
+- The docker backend doesn't do features, docker compose or UID remapping.
+- Ports opened later by a process aren't detected automatically; forward
+  them with `:Devcontainer forward`.
+- File watching runs on the host.
+- `postAttachCommand` runs on every `:Devcontainer up`.
+- Build tasks run without a TTY (no compiler colours).
+- neotest results that adapters stream while running arrive at the end.
+
+ vim:tw=78:ts=8:ft=help:norl:
