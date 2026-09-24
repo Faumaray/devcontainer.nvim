@@ -18,6 +18,7 @@ if [ "$(id -u)" != 0 ] || ! command -v python3 >/dev/null; then
 fi
 if command -v clangd >/dev/null; then
   "$NVIM" --headless --clean -l tests/e2e.lua
+  "$NVIM" --headless --clean -l tests/e2e_lsp_start.lua
 else
   echo "skipping LSP/DAP e2e (needs clangd)"
 fi

@@ -32,7 +32,8 @@ Full documentation: `:help devcontainer`.
   rustaceanvim or `vim.lsp.start()` is transparently spawned with `docker exec` when its root is in
   an attached workspace.
   - Clients that were already running on the host are moved into the container on `up`, and moved
-    back on `stop`.
+    back on `stop`. Servers installed only in the container start for the files that were already
+    open.
   - URIs are translated in both directions: diagnostics, definitions, workspace edits, file
     watchers, and markdown links in hover docs.
 - **Files that exist only in the container** (`/usr/include/c++/13/vector`, SDKs, toolchains) open
@@ -202,17 +203,23 @@ require("devcontainer").setup({
 
 ### Servers that aren't installed on the host
 
-`vim.lsp.enable()` refuses to start a config whose `cmd[1]` isn't executable **on the host**. If
-clangd only exists in the container, wrap the command:
+A server installed only in the container needs nothing special:
 
 ```lua
-vim.lsp.config("clangd", {
-  cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index", "--clang-tidy" }),
-})
+vim.lsp.config("clangd", { cmd = { "clangd", "--background-index", "--clang-tidy" } })
 vim.lsp.enable("clangd")
 ```
 
-`lsp_cmd` runs in the container when the buffer's project is attached, and on the host otherwise.
+`vim.lsp.enable()` refuses to start a config whose `cmd[1]` isn't executable on the host. So once
+a container is attached, enabled configs like that are started in it, also for the files that were
+already open before `:Devcontainer up`. Without a container they don't start (and don't error).
+
+Plugins that start servers themselves (rustaceanvim) need the command wrapped, so it can run in the
+container when the buffer's project is attached, and on the host otherwise:
+
+```lua
+cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" })
+```
 
 Absolute host paths such as mason's `~/.local/share/nvim/mason/bin/clangd` are looked up by their
 basename inside the container. Arguments that contain your workspace path (for example
@@ -586,6 +593,8 @@ NVIM=/path/to/nvim PLUGINS=/path/with/plugins tests/run.sh
 - `tests/e2e.lua` drives a real clangd through a fake docker CLI that bind-mounts the workspace at
   another path in a private mount namespace. It also covers the DAP proxy (stdio and TCP adapters),
   port forwarding, lifecycle events and prompts, git/dotfiles, and the fake devcontainer CLI.
+- `tests/e2e_lsp_start.lua` opens a file before the container starts, with servers that exist only
+  in the container (plain `cmd` and `lsp_cmd`), and checks they start there once it attaches.
 - `tests/e2e_project.lua` builds, runs, tests and debugs a real CMake/Ninja project and a Cargo
   workspace "in the container", with the builtin runner and with overseer.nvim, and profiles.
 - `tests/e2e_integrations.lua` runs conform.nvim, nvim-lint, neotest, snacks.nvim, telescope,

@@ -304,11 +304,15 @@ attached workspace is started with `docker exec -i` and every message is
 translated between host and container paths. Clients already running are
 moved into the container on `up` and back on `stop`.
 
-`vim.lsp.enable()` refuses a config whose `cmd[1]` isn't executable on the
-host. For servers installed only in the container: >lua
-    vim.lsp.config("clangd", {
-      cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" }),
-    })
+Servers installed only in the container need nothing special. `vim.lsp.enable()`
+refuses a config whose `cmd[1]` isn't executable on the host, so once a
+container is attached such enabled configs get a command it accepts, and they
+start in the container, also for the files that were open before
+`:Devcontainer up`. Without a container they don't start.
+
+Plugins that start servers themselves (rustaceanvim) need the command
+wrapped: >lua
+    cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" })
 <
 Absolute host paths (mason's bin folder) are looked up by name in the
 container; workspace paths in arguments are rewritten.

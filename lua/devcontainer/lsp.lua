@@ -148,6 +148,8 @@ function M.rewrite(cfg)
   new._devcontainer_key = nil
 
   if not session then
+    -- installed only in the container (lsp_cmd, or a config adopted while attached): wait for it
+    if vim.fn.executable(host_cmd[1]) == 0 then return nil end
     new.cmd = cfg._devcontainer_host_cmd and host_cmd or cfg.cmd
     return new
   end
@@ -206,6 +208,15 @@ function M.patch()
   if patched then return end
   patched = true
   local orig_start = vim.lsp.start
+
+  local orig_enable = vim.lsp.enable
+  ---@diagnostic disable-next-line: duplicate-set-field
+  vim.lsp.enable = function(name, enable)
+    if enable ~= false and opts().enabled then
+      pcall(M.adopt, type(name) == "table" and name or { name })
+    end
+    return orig_enable(name, enable)
+  end
 
   ---@diagnostic disable-next-line: duplicate-set-field
   vim.lsp.start = function(cfg, start_opts)
@@ -298,8 +309,12 @@ end
 --- Wait (≤3s) for the stopped clients to exit, then start them again for their buffers.
 --- Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
 ---@param entries devcontainer.LspEntry[]
-function M.start_clients(entries)
-  if #entries == 0 then return end
+---@param after? fun()  called once the clients have been started again
+function M.start_clients(entries, after)
+  if #entries == 0 then
+    if after then after() end
+    return
+  end
   local timer = assert(vim.uv.new_timer())
   local waited = 0
   timer:start(0, 100, vim.schedule_wrap(function()
@@ -324,10 +339,48 @@ function M.start_clients(entries)
         end
       end
     end
+    if after then after() end
   end))
 end
 
+--- vim.lsp.enable() won't start a config whose cmd[1] isn't executable on the host (clangd
+--- installed only in the container). While a container is attached, such configs get a cmd
+--- function (M.cmd), which it accepts; the patched vim.lsp.start then runs it in the container.
+---@param names? string[]  default: every enabled config
+function M.adopt(names)
+  if next(registry.by_key) == nil then return end
+  names = names or vim.tbl_keys(vim.lsp._enabled_configs or {})
+  for _, name in ipairs(names) do
+    local ok, cfg = pcall(function() return vim.lsp.config[name] end)
+    local cmd = ok and type(cfg) == "table" and cfg.cmd
+    if type(cmd) == "table" and type(cmd[1]) == "string" and vim.fn.executable(cmd[1]) == 0 and M.managed(name) then
+      vim.lsp.config(name, { cmd = M.cmd(cmd) })
+    end
+  end
+end
+
+--- Run the startup of vim.lsp.enable() (and nvim-lspconfig's setup()) again for the file buffers
+--- in `folder`: servers that couldn't start before the container was attached start now.
+function M.retrigger(folder)
+  local roots = { folder, vim.uv.fs_realpath(folder) }
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(buf)
+    local in_folder = false
+    for _, r in ipairs(roots) do
+      in_folder = in_folder or (name ~= "" and inside(name, r))
+    end
+    if in_folder and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "" and vim.bo[buf].filetype ~= "" then
+      for _, group in ipairs({ "nvim.lsp.enable", "lspconfig" }) do
+        if pcall(vim.api.nvim_get_autocmds, { group = group, event = "FileType" }) then
+          pcall(vim.api.nvim_exec_autocmds, "FileType", { group = group, buffer = buf, modeline = false })
+        end
+      end
+    end
+  end
+end
+
 --- Move every client of `folder` to wherever it should run now (container or host).
+--- Then start the servers that couldn't run before (see M.adopt / M.retrigger).
 function M.restart(folder, entries)
   entries = entries or {}
   local seen = {}
@@ -335,7 +388,8 @@ function M.restart(folder, entries)
   for _, e in ipairs(M.stop_clients(folder)) do
     if not seen[e.client.id] then entries[#entries + 1] = e end
   end
-  M.start_clients(entries)
+  M.adopt()
+  M.start_clients(entries, function() M.retrigger(folder) end)
 end
 
 return M
