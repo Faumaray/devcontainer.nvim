@@ -161,8 +161,10 @@ lsp                                                *devcontainer-option-lsp*
                           workspace: offer to install clangd, clang-tidy and
                           clang-format ("ask"), install them (true) or not
                           (false), see |devcontainer-install-tools|
-    llvm_version = nil    LLVM major version to install (nil = the latest
-                          stable release)
+    llvm_version = nil    LLVM major version to install (nil = the newest
+                          there is)
+    llvm_mirror = nil     an apt.llvm.org mirror to use instead (like
+                          llvm.sh -m)
 
 project                                        *devcontainer-option-project*
     runner = "auto"       "auto" (overseer.nvim when installed),
@@ -352,11 +354,18 @@ compile_commands.json that is symlinked into the project root.
 When a C/C++ workspace (CMakeLists.txt, compile_commands.json, meson.build,
 .clangd, or an open C/C++ file) is attached to a container without clangd,
 you're asked whether to install clangd, clang-tidy and clang-format
-(`lsp.install_tools`); `:Devcontainer install` does it any time. As root:
-Debian/Ubuntu get the latest stable LLVM from apt.llvm.org (llvm.sh, or
-`lsp.llvm_version`), linked by their plain names in /usr/local/bin, or the
-distribution's packages when apt.llvm.org doesn't support the release;
-dnf/yum, zypper, apk and pacman systems get the distribution's packages.
+(`lsp.install_tools`); `:Devcontainer install` does it any time. As root,
+the newest there is (or `lsp.llvm_version`), from the first source that
+works:
+  1. apt.llvm.org (Debian/Ubuntu): the current LLVM release (the one llvm.sh
+     installs), only clangd-N, clang-tidy-N and clang-format-N; the
+     repository is added directly (add-apt-repository breaks when python3
+     isn't the distribution's); `lsp.llvm_mirror` for a mirror
+  2. the PyPI wheels (glibc systems), in a venv in /opt/devcontainer-nvim/llvm
+  3. the distribution's newest versioned packages, or its clang tools
+     package (dnf/yum, zypper, apk, pacman; Alpine and Arch skip 1 and 2)
+Versioned binaries are linked by their plain names in /usr/local/bin;
+`:Devcontainer log` tells which source worked and why others didn't.
 clangd then restarts in the container. Only the running container changes:
 after a rebuild you're asked again ("Never" is remembered per project); add
 the tools to the image to keep them.
@@ -481,11 +490,14 @@ the host are copied in first.
 
 conform.nvim ~
 >lua
-    require("devcontainer.integrations.conform").setup()  -- after conform.setup()
+    require("devcontainer.integrations.conform").setup()
 <
 Formatters run in the buffer's container, on the host elsewhere or when the
-tool isn't in the image. `setup({ formatters = { ... }, exclude = { ... } })`
-limits them; `.wrap(name)` wraps one.
+tool isn't in the image. `setup()` hooks conform's formatter lookup: call it
+before or after conform.setup(); formatters defined later are covered too.
+`setup({ formatters = { ... }, exclude = { ... } })` limits them;
+`.wrap(name)` wraps one. Without conform.nvim (or nvim-lint, for its
+`setup()`) it warns and does nothing.
 
 nvim-lint ~
 >lua

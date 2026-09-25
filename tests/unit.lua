@@ -663,31 +663,69 @@ test("wrap_cmd: exec argv with mapped paths, unchanged without a container", fun
 end)
 
 test("conform: formatters run in the container, host config outside", function()
-  local util = { merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end }
-  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = { cpp = { "clang_format" }, py = { { "black" } } } }
-  package.loaded["conform"], package.loaded["conform.util"] = conform, util
+  -- conform's own lookup: built-in definition + the user's override
+  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = {} }
+  function conform.get_formatter_config(name, bufnr)
+    local override = conform.formatters[name]
+    if type(override) == "function" then override = override(bufnr) end
+    if type(override) == "table" and override.inherit == false then return override end
+    local ok, builtin = pcall(require, "conform.formatters." .. name)
+    if not ok then return override end
+    return override and vim.tbl_deep_extend("force", builtin, override) or builtin
+  end
+  package.loaded["conform"], package.loaded["conform.util"] = conform, {
+    merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end,
+  }
   package.loaded["conform.formatters.clang_format"] = { command = "clang-format", args = { "--assume-filename", "$FILENAME" } }
   package.loaded["conform.formatters.black"] = { command = "black", args = { "--stdin-filename", "$FILENAME", "-" } }
-  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format" })
+  package.loaded["conform.formatters.stylua"] = { command = "stylua", args = { "-" } }
+  local integ = require("devcontainer.integrations.conform")
+  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format", stylua = "/usr/bin/stylua" })
   session_mod.register(s)
-  require("devcontainer.integrations.conform").setup()
-  eq(type(conform.formatters.clang_format), "function")
-  eq(type(conform.formatters.black), "function")
+  eq(integ.setup(), true) -- before the formatters are configured: fine
+  conform.formatters_by_ft = { cpp = function() return { "clang_format" } end } -- functions too
   local buf = scratch_named("/home/me/proj/src/a.cpp")
-  local cfg = conform.formatters.clang_format(buf)
-  eq({ cfg.command, cfg.inherit }, { "docker", false })
+  local cfg = conform.get_formatter_config("clang_format", buf)
+  eq({ cfg.command, cfg.inherit, cfg._devcontainer }, { "docker", false, s.key })
   local args = cfg.args(cfg, { filename = "/home/me/proj/src/a.cpp", dirname = "/home/me/proj/src", buf = buf })
   eq(vim.list_slice(args, #args - 2), { "/usr/bin/clang-format", "--assume-filename", "/workspaces/proj/src/a.cpp" })
   eq(args[1], "exec")
-  -- black isn't in the container: host definition (with the user's override merged)
-  local b = conform.formatters.black(buf)
-  eq({ b.command, b.inherit }, { "black", false })
-  local out = scratch_named("/elsewhere/a.cpp")
-  eq(conform.formatters.clang_format(out).command, "clang-format")
-  require("devcontainer.integrations.conform").setup() -- idempotent
-  eq(conform.formatters.clang_format(buf).command, "docker")
+  -- black isn't in the container: the host definition (with the user's override)
+  local b = conform.get_formatter_config("black", buf)
+  eq({ b.command, b.prepend_args }, { "black", { "-q" } })
+  -- defined after setup()
+  conform.formatters.my_fmt = { command = "stylua", args = { "-" } }
+  eq(conform.get_formatter_config("my_fmt", buf).command, "docker", "a formatter defined later")
+  -- Lua formatters, and buffers outside the workspace, stay as they are
+  conform.formatters.lua_fmt = { format = function() end }
+  eq(conform.get_formatter_config("lua_fmt", buf).command, nil)
+  eq(conform.get_formatter_config("clang_format", scratch_named("/elsewhere/a.cpp")).command, "clang-format")
+  -- exclude / only; setup() again doesn't wrap twice
+  integ.setup({ exclude = { "clang_format" } })
+  eq(conform.get_formatter_config("clang_format", buf).command, "clang-format", "excluded")
+  integ.setup({ formatters = { "stylua" } })
+  eq({ conform.get_formatter_config("clang_format", buf).command, conform.get_formatter_config("stylua", buf).command },
+    { "clang-format", "docker" }, "only the listed ones")
+  integ.setup()
+  eq(conform.get_formatter_config("clang_format", buf).args(cfg, { filename = "/home/me/proj/src/a.cpp",
+    dirname = "/home/me/proj/src", buf = buf })[1], "exec", "wrapped once")
+  -- per formatter
+  conform.formatters.wrapped = integ.wrap("clang_format", { command = "clang-format" })
+  eq(conform.get_formatter_config("wrapped", buf).command, "docker")
   session_mod.unregister(s)
   package.loaded["conform"], package.loaded["conform.util"] = nil, nil
+end)
+
+test("conform / nvim-lint setup without the plugin: a warning, no error", function()
+  package.loaded["lint"], package.loaded["conform"] = nil, nil
+  local orig = package.preload
+  local ok1, r1 = pcall(require("devcontainer.integrations.lint").setup)
+  eq({ ok1, r1 }, { true, false })
+  -- conform's integration was set up above (with the stub); a fresh copy sees no conform.nvim
+  package.loaded["devcontainer.integrations.conform"] = nil
+  local ok2, r2 = pcall(require("devcontainer.integrations.conform").setup)
+  eq({ ok2, r2 }, { true, false })
+  eq(package.preload, orig)
 end)
 
 test("nvim-lint: linters run in the container, output mapped back", function()
@@ -1144,62 +1182,118 @@ test("tools.offer: asks once for C/C++ workspaces without clangd, remembers neve
   vim.ui.select, tools.install = orig_select, orig_install
 end)
 
-test("tools: the LLVM install script (llvm.sh, distribution fallback, dnf)", function()
+test("tools: the install script takes the newest (apt.llvm.org, PyPI, the distribution's newest)", function()
   local tools = require("devcontainer.tools")
   local dir = tmp .. "/llvm-inst"
-  local sys, stubs, root, bin, log = dir .. "/sys", dir .. "/stubs", dir .. "/root", dir .. "/bin", dir .. "/calls"
+  local sys, stubs, root, bin, venv, log = dir .. "/sys", dir .. "/stubs", dir .. "/root", dir .. "/bin", dir .. "/venv", dir .. "/calls"
   vim.fn.mkdir(sys, "p")
-  for _, t in ipairs({ "sh", "sed", "head", "mktemp", "rm", "mkdir", "ln", "touch", "chmod", "cat" }) do
+  for _, t in ipairs({ "sh", "sed", "tr", "head", "mktemp", "rm", "mkdir", "ln", "touch", "chmod", "cat", "sort", "find" }) do
     vim.uv.fs_symlink(vim.fn.exepath(t), sys .. "/" .. t)
   end
   local function stub(name, body)
     writef(stubs .. "/" .. name, "#!/bin/sh\necho \"" .. name .. " $*\" >> \"$LOG\"\n" .. (body or "") .. "\n")
     vim.uv.fs_chmod(stubs .. "/" .. name, 493)
   end
-  local function run(env, version)
+  local function run(env, ...)
     vim.fn.delete(log)
-    vim.fn.delete(root, "rf")
-    vim.fn.delete(bin, "rf")
-    local res = vim.system({ sys .. "/sh", "-c", tools.LLVM_SCRIPT, "sh", version or "" }, {
-      env = vim.tbl_extend("force", { PATH = stubs .. ":" .. sys, LOG = log, DEVCONTAINER_ROOT = root, DEVCONTAINER_BIN_DIR = bin }, env or {}),
+    for _, d in ipairs({ bin, venv, root .. "/usr", root .. "/etc/apt" }) do vim.fn.delete(d, "rf") end
+    writef(root .. "/etc/os-release", 'NAME="Ubuntu"\nVERSION_CODENAME=jammy\nUBUNTU_CODENAME=jammy\n')
+    local res = vim.system(vim.list_extend({ sys .. "/sh", "-c", tools.LLVM_SCRIPT, "sh" }, { ... }), {
+      env = vim.tbl_extend("force", { PATH = stubs .. ":" .. sys, LOG = log, DEVCONTAINER_ROOT = root,
+        DEVCONTAINER_BIN_DIR = bin, DEVCONTAINER_LLVM_VENV = venv }, env or {}),
       clear_env = true,
     }):wait()
     return res.code, vim.fn.filereadable(log) == 1 and vim.fn.readfile(log) or {}
   end
-  -- apt: llvm.sh with its CURRENT_LLVM_STABLE, then clang-tidy / clang-format, linked by plain name
+  local function has(calls, line) return vim.tbl_contains(calls, line) end
+  -- installing clangd-N / clang-tidy-N / clang-format-N puts them in /usr/lib/llvm-N/bin
   stub("apt-get", [[
-for a; do case "$a" in clang-tidy-*|clang-format-*) v=${a##*-}; t=${a%-*}
+[ "$1" = install ] || exit 0
+for a; do case "$a" in clangd-*|clang-tidy-*|clang-format-*) v=${a##*-}; t=${a%-*}
   mkdir -p "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin" && touch "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin/$t" && chmod +x "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin/$t";; esac; done]])
-  stub("wget", [[[ -n "$FAIL_WGET" ] && exit 1; printf 'CURRENT_LLVM_STABLE=21\nCURRENT_LLVM_TRUNK=22\n' > "$2"]])
-  stub("bash", [[[ -n "$FAIL_LLVM" ] && exit 1; mkdir -p "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin"
-touch "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin/clangd"; chmod +x "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin/clangd"]])
+  stub("apt-cache", [[
+if [ "$1" = search ]; then for v in $APT_VERSIONS; do echo "clangd-$v - Language server"; done; exit 0; fi
+for a; do case "$a" in clang-*) case " $APT_VERSIONS " in *" ${a##*-} "*) ;; *) exit 100;; esac;; esac; done]])
+  stub("wget", [[
+case "$3" in
+  */llvm.sh) [ -z "$FAIL_WGET" ] && printf 'CURRENT_LLVM_STABLE=22\nCURRENT_LLVM_TRUNK=23\n' > "$2";;
+  */Release) [ -z "$FAIL_RELEASE" ];;
+  *.key) echo KEY > "$2";;
+esac]])
+  stub("python3", [[
+[ "$1 $2" = "-m venv" ] || exit 1
+mkdir -p "$4/bin"
+cat > "$4/bin/python" <<'EOF'
+#!/bin/sh
+echo "venv-python $*" >> "$LOG"
+[ -n "$FAIL_PIP" ] && exit 1
+for p in clangd:clangd clang_tidy:clang-tidy clang_format:clang-format; do
+  d="$DEVCONTAINER_LLVM_VENV/lib/python3.12/site-packages/${p%%:*}/data/bin"
+  mkdir -p "$d" && touch "$d/${p#*:}" && chmod +x "$d/${p#*:}"
+done
+EOF
+chmod +x "$4/bin/python"]])
+
+  -- 1. apt.llvm.org: llvm.sh's current release, its repository added directly, only the three tools
   local code, calls = run()
   eq(code, 0)
   eq(calls[1], "apt-get update")
-  assert(calls[2]:find("lsb-release", 1, true) and calls[2]:find("software-properties-common", 1, true), calls[2])
-  assert(calls[3]:match("^wget %-qO .*/llvm%.sh https://apt%.llvm%.org/llvm%.sh$"), calls[3])
-  assert(calls[4]:match("^bash .*/llvm%.sh 21$"), calls[4])
-  eq(calls[5], "apt-get install -y --no-install-recommends clang-tidy-21 clang-format-21")
+  assert(calls[2]:match("^wget %-qO .* https://apt%.llvm%.org/llvm%.sh$"), calls[2])
+  local list = root .. "/etc/apt/sources.list.d/apt.llvm.org-22.list"
+  eq(vim.list_slice(calls, 3), {
+    "wget -qO /dev/null https://apt.llvm.org/jammy/dists/llvm-toolchain-jammy-22/Release",
+    "wget -qO " .. root .. "/etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key",
+    "apt-get update -o Dir::Etc::sourcelist=" .. list .. " -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0",
+    "apt-get install -y --no-install-recommends clangd-22 clang-tidy-22 clang-format-22",
+  })
+  eq(vim.fn.readfile(list), { "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" })
   for _, t in ipairs({ "clangd", "clang-tidy", "clang-format" }) do
-    eq(vim.uv.fs_readlink(bin .. "/" .. t), root .. "/usr/lib/llvm-21/bin/" .. t)
+    eq(vim.uv.fs_readlink(bin .. "/" .. t), root .. "/usr/lib/llvm-22/bin/" .. t)
   end
-  code, calls = run(nil, "19")
-  assert(calls[4]:match("^bash .*/llvm%.sh 19$"), "lsp.llvm_version: " .. calls[4])
-  -- llvm.sh fails (unsupported release): the distribution's packages
-  code, calls = run({ FAIL_LLVM = "1" })
+  -- a pinned version and a mirror
+  code, calls = run(nil, "20", "https://mirror.example/llvm")
   eq(code, 0)
-  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd clang-tidy clang-format")
-  code, calls = run({ FAIL_WGET = "1" })
-  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd clang-tidy clang-format", "no network to apt.llvm.org")
-  -- no apt: dnf
-  vim.fn.delete(stubs, "rf")
+  local fetched_llvm_sh = vim.tbl_filter(function(c) return c:match("/llvm%.sh$") ~= nil end, calls)
+  eq(fetched_llvm_sh, {}, "pinned: no need for llvm.sh")
+  assert(has(calls, "wget -qO /dev/null https://mirror.example/llvm/jammy/dists/llvm-toolchain-jammy-20/Release"), vim.inspect(calls))
+  eq(vim.fn.readfile(root .. "/etc/apt/sources.list.d/apt.llvm.org-20.list"), { "deb https://mirror.example/llvm/jammy/ llvm-toolchain-jammy-20 main" })
+
+  -- 2. apt.llvm.org doesn't work: PyPI wheels in a venv, linked from their packages
+  code, calls = run({ FAIL_RELEASE = "1" })
+  eq(code, 0)
+  assert(has(calls, "python3 -m venv --clear " .. venv), vim.inspect(calls))
+  assert(has(calls, "venv-python -m pip install --upgrade --only-binary=:all: clangd clang-tidy clang-format"), vim.inspect(calls))
+  eq(vim.uv.fs_readlink(bin .. "/clangd"), venv .. "/lib/python3.12/site-packages/clangd/data/bin/clangd")
+  eq(vim.uv.fs_readlink(bin .. "/clang-format"), venv .. "/lib/python3.12/site-packages/clang_format/data/bin/clang-format")
+  eq(vim.fn.glob(root .. "/etc/apt/sources.list.d/*"), "", "the unusable apt.llvm.org source is removed again")
+  code, calls = run({ FAIL_RELEASE = "1" }, "20")
+  assert(has(calls, "venv-python -m pip install --upgrade --only-binary=:all: clangd==20.* clang-tidy==20.* clang-format==20.*"), vim.inspect(calls))
+
+  -- 3. neither: the distribution's newest versioned packages, not its default
+  code, calls = run({ FAIL_RELEASE = "1", FAIL_PIP = "1", APT_VERSIONS = "14 15" })
+  eq(code, 0)
+  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd-15 clang-tidy-15 clang-format-15")
+  eq(vim.uv.fs_readlink(bin .. "/clangd"), root .. "/usr/lib/llvm-15/bin/clangd")
+  code, calls = run({ FAIL_RELEASE = "1", FAIL_PIP = "1" })
+  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd clang-tidy clang-format", "no versioned ones")
+
+  -- no apt: PyPI first, then dnf
+  for _, n in ipairs({ "apt-get", "apt-cache", "wget" }) do vim.fn.delete(stubs .. "/" .. n) end
   stub("dnf")
   code, calls = run()
-  eq({ code, calls }, { 0, { "dnf install -y clang-tools-extra" } })
+  eq(code, 0)
+  eq(calls[1], "python3 -m venv --clear " .. venv)
+  code, calls = run({ FAIL_PIP = "1" })
+  eq(calls[#calls], "dnf install -y clang-tools-extra")
+  -- Alpine (musl: no wheels) / Arch (rolling): the distribution's
+  vim.fn.delete(stubs .. "/dnf")
+  stub("apk")
+  code, calls = run()
+  eq({ code, calls }, { 0, { "apk add --no-cache clang-extra-tools" } })
   vim.fn.delete(stubs, "rf")
   vim.fn.mkdir(stubs, "p")
   code = run()
-  eq(code, 1, "no package manager")
+  eq(code, 1, "no package manager, no python3")
 end)
 
 test("runner.ssh_hint: git over SSH failures point at checkhealth", function()

@@ -37,7 +37,7 @@ Full documentation: `:help devcontainer`.
   - URIs are translated in both directions: diagnostics, definitions, workspace edits, file
     watchers, and markdown links in hover docs.
   - No clangd in the container of a C/C++ project? You're offered the latest clangd, clang-tidy
-    and clang-format (apt.llvm.org, or the distribution's packages).
+    and clang-format (apt.llvm.org, PyPI or the distribution's newest).
 - **Files that exist only in the container** (`/usr/include/c++/13/vector`, SDKs, toolchains) open
   as `devcontainer://<id>/...` buffers. "Go to definition" into the standard library works like in
   VS Code. `:Devcontainer files` finds them with your picker.
@@ -168,7 +168,8 @@ require("devcontainer").setup({
                            -- build dir (build/Debug, a profile's dir, ...); false keeps them as written
     install_tools = "ask", -- no clangd in the container of a C/C++ workspace: offer to install clangd,
                            -- clang-tidy and clang-format ("ask"), just install them (true) or not (false)
-    llvm_version = nil,    -- LLVM major version for that (nil = the latest stable release)
+    llvm_version = nil,    -- LLVM major version for that (nil = the newest there is)
+    llvm_mirror = nil,     -- an apt.llvm.org mirror to use instead (like llvm.sh -m)
   },
   project = {
     runner = "auto",       -- "auto" (overseer.nvim when installed) | "overseer" | "builtin"
@@ -236,22 +237,30 @@ cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" })
 
 When a C/C++ workspace (CMakeLists.txt, compile_commands.json, meson.build, .clangd, or an open
 C/C++ file) is attached to a container without clangd, you're asked whether to install clangd,
-clang-tidy and clang-format; `:Devcontainer install` does it any time. They are installed as root:
+clang-tidy and clang-format; `:Devcontainer install` does it any time. They are installed as root,
+the newest there is (or `lsp.llvm_version`), from the first of these that works:
 
-- Debian / Ubuntu: the latest stable LLVM from [apt.llvm.org](https://apt.llvm.org) (`llvm.sh`,
-  or `lsp.llvm_version`), linked as `clangd`, `clang-tidy` and `clang-format` in `/usr/local/bin`;
-  the distribution's packages when apt.llvm.org doesn't support the release
-- Fedora / RHEL (`dnf`, `yum`), openSUSE (`zypper`), Alpine (`apk`), Arch (`pacman`): the
-  distribution's packages
+1. [apt.llvm.org](https://apt.llvm.org) (Debian / Ubuntu): the current LLVM release (the one
+   `llvm.sh` installs), only `clangd-N`, `clang-tidy-N` and `clang-format-N`. The repository is
+   added directly: `add-apt-repository`, which `llvm.sh` needs, breaks when `python3` isn't the
+   distribution's. `lsp.llvm_mirror` points it at a mirror.
+2. The PyPI wheels (`clangd`, `clang-tidy`, `clang-format`; glibc systems), in a venv in
+   `/opt/devcontainer-nvim/llvm`. Your pip configuration (index, proxy) applies.
+3. The distribution's newest versioned packages (`clangd-20` rather than the default `clangd`),
+   or its clang tools package: `dnf`/`yum` `clang-tools-extra`, `zypper` `clang-tools`, `apk`
+   `clang-extra-tools`, `pacman` `clang` (Alpine and Arch skip 1 and 2).
 
-Then clangd restarts in the container, and conform.nvim / nvim-lint use the new clang-format and
-clang-tidy. This changes the running container only: after a rebuild you're asked again ("Never"
-is remembered per project). To keep them, add them to the image, e.g. in the Dockerfile:
+The versioned binaries are linked as `clangd`, `clang-tidy` and `clang-format` in `/usr/local/bin`.
+`:Devcontainer log` tells which source worked and why others didn't. Then clangd restarts in the
+container, and conform.nvim / nvim-lint use the new clang-format and clang-tidy. This changes the
+running container only: after a rebuild you're asked again ("Never" is remembered per project). To
+keep them, add them to the image, e.g. in the Dockerfile (Ubuntu 22.04):
 
 ```dockerfile
-RUN apt-get update && apt-get install -y lsb-release wget software-properties-common gnupg \
- && wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 20 \
- && apt-get install -y clang-tidy-20 clang-format-20
+RUN apt-get update && apt-get install -y wget ca-certificates \
+ && wget -qO /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
+ && echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" > /etc/apt/sources.list.d/llvm.list \
+ && apt-get update && apt-get install -y clangd-22 clang-tidy-22 clang-format-22
 ```
 
 Absolute host paths such as mason's `~/.local/share/nvim/mason/bin/clangd` are looked up by their
@@ -439,16 +448,18 @@ scripts that only exist on the host (neotest-python's `neotest.py`, ...) are cop
 ### conform.nvim and nvim-lint
 
 ```lua
-require("conform").setup({ formatters_by_ft = { cpp = { "clang_format" }, python = { "ruff_format" } } })
-require("devcontainer.integrations.conform").setup()        -- after conform.setup()
+require("devcontainer.integrations.conform").setup()        -- before or after conform.setup()
 
 require("lint").linters_by_ft = { python = { "ruff", "mypy" } }
 require("devcontainer.integrations.lint").setup()           -- after linters_by_ft
 ```
 
 Formatters and linters then run inside the buffer's container (and on the host elsewhere, or when
-the tool isn't in the image). `setup({ formatters = { "clang_format" }, exclude = { ... } })`
-limits which ones; `.wrap(name)` wraps a single one. Container paths in linter output are mapped
+the tool isn't in the image). The conform integration hooks conform's formatter lookup, so it also
+covers formatters defined later (`formatters_by_ft` functions, distributions and plugins adding
+their own). `setup({ formatters = { "clang_format" }, exclude = { ... } })` limits which ones;
+`.wrap(name)` wraps a single one. Without the plugin installed, `setup()` warns and does nothing;
+`:checkhealth devcontainer` shows whether each integration is set up. Container paths in linter output are mapped
 back before nvim-lint's parser sees them. A formatter or linter without a `cwd` of its own runs in
 the file's project root (its CMake / Cargo / git root, else the workspace folder), not in Neovim's
 cwd; language servers in the container run in their `root_dir` unless they have a `cmd_cwd`.
