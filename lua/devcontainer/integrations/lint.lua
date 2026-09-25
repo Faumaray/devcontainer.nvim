@@ -54,7 +54,8 @@ function M.in_container(session, name, base)
   if not base.stdin and base.append_fname ~= false then
     inner[#inner + 1] = session:map_arg(vim.api.nvim_buf_get_name(0))
   end
-  local host_cwd = base.cwd or vim.fn.getcwd()
+  -- the linter's own cwd, else its project's root (not Neovim's cwd: a subfolder, or none of the container)
+  local host_cwd = base.cwd or require("devcontainer.project").root_for(vim.api.nvim_buf_get_name(0)) or vim.fn.getcwd()
   local argv = session:exec_argv(inner, {
     stdin = true,
     cwd = session:remote_path(host_cwd) or session.remote_folder,
@@ -67,6 +68,7 @@ function M.in_container(session, name, base)
   out.args = vim.list_slice(argv, 2)
   out.append_fname = false
   out.env = nil
+  out.cwd = host_cwd -- what the parser resolves relative file names against
   out.parser = wrap_parser(base.parser, session)
   return out
 end

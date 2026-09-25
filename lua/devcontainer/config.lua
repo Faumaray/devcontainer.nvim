@@ -70,6 +70,9 @@ M.defaults = {
     -- where :Devcontainer shell / exec and `run` tasks open: "builtin" (a split) | "snacks" |
     -- "toggleterm" | fun(argv, { cwd, env, title, height, on_exit })
     provider = "builtin",
+    -- where :Devcontainer shell / exec start: "project" (the current file's CMake / Cargo / git
+    -- root, else the workspace folder) | "workspace" | "file" (the current file's directory)
+    cwd = "project",
   },
   ports = {
     -- forward devcontainer.json `forwardPorts` when attaching (:Devcontainer forward for others)

@@ -129,10 +129,14 @@ files = { roots = { ... } }                      *devcontainer-option-files*
     registry, rustup toolchains, python site-packages, Go sources, global
     node_modules, /usr/lib/jvm.
 
-terminal = { provider = "builtin" }           *devcontainer-option-terminal*
-    Where `:Devcontainer shell` / `exec` and `run` tasks open: "builtin" (a
-    split), "snacks", "toggleterm", or a function(argv, opts) with opts
-    `{ cwd, env, title, height, on_exit }`.
+terminal = { provider = "builtin", cwd = "project" }
+                                              *devcontainer-option-terminal*
+    `provider`: where `:Devcontainer shell` / `exec` and `run` tasks open:
+    "builtin" (a split), "snacks", "toggleterm", or a function(argv, opts)
+    with opts `{ cwd, env, title, height, on_exit }`.
+    `cwd`: where `shell` / `exec` start: "project" (the current file's CMake,
+    Cargo or git root, else the workspace folder), "workspace" or "file"
+    (the current file's directory).
 
 ports                                            *devcontainer-option-ports*
     `{ forward = true, bind_address = "127.0.0.1", relay = nil }`
@@ -214,9 +218,11 @@ Container ~
 :Devcontainer init                Add a devcontainer config to the project
                                   from a template (|devcontainer-init|).
 :Devcontainer config              Open devcontainer.json.
-:Devcontainer shell               Login shell of the remote user.
-:Devcontainer exec {cmd}          Run {cmd} in the container, in the current
-                                  file's directory.
+:Devcontainer shell               Login shell of the remote user, in the
+                                  current file's project root
+                                  (|devcontainer-option-terminal|).
+:Devcontainer exec {cmd}          Run {cmd} in the container, in the same
+                                  directory.
 :Devcontainer files [dir]         Find and open container-only files.
 :Devcontainer ports               Forwarded ports: open, copy, stop.
 :Devcontainer forward {port} [local]
@@ -488,6 +494,11 @@ nvim-lint ~
 Linters run in the container; container paths in their output are mapped
 back before the parser sees them.
 
+Formatters and linters without a `cwd` of their own run in the file's
+project root (its CMake, Cargo or git root, else the workspace folder), not
+in Neovim's cwd. Language servers in the container run in their `root_dir`
+unless they have a `cmd_cwd`.
+
 Terminals ~
 |devcontainer-option-terminal| opens shells and run tasks in snacks.nvim or
 toggleterm. For your own: >lua
@@ -552,7 +563,8 @@ wrap_cmd({argv}, {opts})                           *devcontainer.wrap_cmd()*
     session) without one. {opts}: `{ path?, cwd?, env?, tty?, stdin? }`.
     Returns argv, session.
 shell_cmd({opts})                                 *devcontainer.shell_cmd()*
-    Login shell argv, or nil without a container.
+    Login shell argv, or nil without a container. {opts}: `{ path?, cwd? }`;
+    it starts where `:Devcontainer shell` would.
 lsp_cmd({argv})                                     *devcontainer.lsp_cmd()*
 dap_adapter({spec})                             *devcontainer.dap_adapter()*
 profile({name}), options({path}), add_profiles({defs})

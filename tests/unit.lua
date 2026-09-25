@@ -1209,5 +1209,68 @@ test("runner.ssh_hint: git over SSH failures point at checkhealth", function()
   eq(runner.ssh_hint({ "main.cpp:3:1: error: expected ';'" }), false)
 end)
 
+test("project root: shell, formatters, linters and servers start there, not in a subfolder", function()
+  local ws = tmp .. "/rootws"
+  writef(ws .. "/app/CMakeLists.txt", "")
+  writef(ws .. "/app/src/deep/x.cpp", "")
+  writef(ws .. "/lib/.git", "gitdir: ../.git/modules/lib\n") -- a submodule, no build file
+  writef(ws .. "/lib/y.py", "")
+  writef(ws .. "/notes/z.txt", "")
+  local s = session_mod.new({ container_id = "fedcba9876543210", local_folder = ws, remote_folder = "/workspaces/rootws",
+    remote_user = "vscode", docker = "docker" })
+  s.env = {}
+  s.which = function(_, b) return "/usr/bin/" .. b end
+  session_mod.register(s)
+  local project = require("devcontainer.project")
+  eq(project.root_for(ws .. "/app/src/deep/x.cpp"), ws .. "/app", "CMake project")
+  eq(project.root_for(ws .. "/app/src/deep"), ws .. "/app", "a directory")
+  eq(project.root_for(ws .. "/lib/y.py"), ws .. "/lib", "git root")
+  eq(project.root_for(ws .. "/notes/z.txt"), ws, "the workspace")
+
+  local function w(argv)
+    for i, a in ipairs(argv or {}) do
+      if a == "-w" then return argv[i + 1] end
+    end
+  end
+  local orig_cwd = vim.fn.getcwd()
+  vim.cmd.cd(ws .. "/app/src/deep") -- Neovim started in a subfolder
+  local buf = vim.fn.bufadd(ws .. "/app/src/deep/x.cpp")
+  vim.fn.bufload(buf)
+  vim.api.nvim_set_current_buf(buf)
+  local dcm = require("devcontainer")
+  eq(w(dcm.shell_cmd()), "/workspaces/rootws/app")
+  config.set({ terminal = { cwd = "file" } })
+  eq(w(dcm.shell_cmd()), "/workspaces/rootws/app/src/deep")
+  config.set({ terminal = { cwd = "workspace" } })
+  eq(w(dcm.shell_cmd()), "/workspaces/rootws")
+  config.set({})
+  local term, opened = require("devcontainer.terminal"), nil
+  local orig_open = term.open
+  term.open = function(argv) opened = argv end
+  dcm.exec() -- :Devcontainer shell
+  term.open = orig_open
+  eq(w(opened), "/workspaces/rootws/app", ":Devcontainer shell")
+
+  local cfg = require("devcontainer.integrations.conform").in_container(s, "clang_format",
+    { command = "clang-format", args = { "$RELATIVE_FILEPATH" } })
+  local args = cfg.args(cfg, { filename = ws .. "/app/src/deep/x.cpp", dirname = ws .. "/app/src/deep", buf = buf })
+  eq({ w(args), args[#args] }, { "/workspaces/rootws/app", "src/deep/x.cpp" }, "formatter")
+  local l = require("devcontainer.integrations.lint").in_container(s, "tidy", { cmd = "clang-tidy", args = {}, stdin = true })
+  eq({ w(l.args), l.cwd }, { "/workspaces/rootws/app", ws .. "/app" }, "linter (and its parser's cwd)")
+  local own = require("devcontainer.integrations.lint").in_container(s, "tidy", { cmd = "clang-tidy", args = {}, stdin = true, cwd = ws .. "/notes" })
+  eq(w(own.args), "/workspaces/rootws/notes", "a linter's own cwd wins")
+
+  local new = lsp.rewrite({ name = "clangd", cmd = { "clangd" }, root_dir = ws .. "/app" })
+  local got
+  local orig_rpc = lsp.rpc
+  lsp.rpc = function(_, _, _, extra) got = extra.cwd end
+  new.cmd({}, new)
+  lsp.rpc = orig_rpc
+  eq(got, "/workspaces/rootws/app", "language server")
+
+  vim.cmd.cd(orig_cwd)
+  session_mod.unregister(s)
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

@@ -176,8 +176,9 @@ local function remote_start_fn(key, argv)
   return function(dispatchers, cfg)
     local session = registry.by_key[key]
     if not session then error("devcontainer " .. key .. " is not attached", 0) end
-    -- like on the host: cmd_cwd, else Neovim's cwd (so relative arguments mean the same thing)
-    local cwd = cfg.cmd_cwd or vim.fn.getcwd()
+    -- cmd_cwd, else the server's root (relative arguments like --compile-commands-dir=build mean
+    -- the project's), else Neovim's cwd
+    local cwd = cfg.cmd_cwd or (type(cfg.root_dir) == "string" and cfg.root_dir) or vim.fn.getcwd()
     return M.rpc(session, argv, dispatchers, {
       cwd = session.lsp:path_to_remote(cwd) or nil,
       env = cfg.cmd_env,
