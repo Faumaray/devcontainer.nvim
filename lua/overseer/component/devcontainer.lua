@@ -53,6 +53,12 @@ return {
         end
       end,
       on_complete = function(self, task, status)
+        if self.session and status == "FAILURE" then
+          local ok, buf = pcall(task.get_bufnr, task)
+          if ok and buf and vim.api.nvim_buf_is_valid(buf) then
+            runner.ssh_hint(vim.api.nvim_buf_get_lines(buf, 0, -1, false))
+          end
+        end
         if self.session then
           local last = vim.fn.getqflist({ nr = "$" }).nr
           for nr = 1, last do

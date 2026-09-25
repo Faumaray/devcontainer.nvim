@@ -39,6 +39,9 @@ M.defaults = {
     ssh_agent = true,
     -- copy ~/.gitconfig into the container when it has none: true | false | path of the file to copy
     gitconfig = true,
+    -- add the hosts of ~/.ssh/known_hosts to the container user's known_hosts (builds can't answer
+    -- ssh's "continue connecting?"): true | false | path of the file to copy
+    known_hosts = true,
   },
   dotfiles = {
     -- "owner/repo" (GitHub) or any git URL, cloned into new containers
@@ -91,6 +94,11 @@ M.defaults = {
     -- init_options.compilationDatabasePath) follows the project's active build dir (build/Debug,
     -- the dir of the selected profile / preset); false keeps what the config says
     follow_build_dir = true,
+    -- clangd missing in the container of a C/C++ workspace: offer to install clangd, clang-tidy and
+    -- clang-format ("ask"), install them right away (true) or not (false); :Devcontainer install
+    install_tools = "ask",
+    -- LLVM major version to install from apt.llvm.org (nil = the latest stable release)
+    llvm_version = nil,
   },
   -- :Devcontainer configure/build/run/test/clean/debug — run in the container when attached, else on the host
   project = {

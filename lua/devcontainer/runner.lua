@@ -93,6 +93,18 @@ function M.parse(lines, efm, cwd)
   return items
 end
 
+--- A task in the container failed on git over SSH: point at the check that tells why.
+---@param lines string[] its output
+function M.ssh_hint(lines)
+  for _, l in ipairs(lines) do
+    if l:find("Permission denied (publickey", 1, true) or l:find("Host key verification failed", 1, true) then
+      log.warn("git over SSH failed in the container — :checkhealth devcontainer shows the agent and known_hosts it sees")
+      return true
+    end
+  end
+  return false
+end
+
 -- specs --------------------------------------------------------------------------------------
 
 local function session_of(spec)
@@ -241,6 +253,7 @@ local function builtin(spec, done)
       else
         log.error(("%s: failed with exit code %d%s"):format(spec.name, code,
           errors > 0 and (" — %d quickfix entries"):format(errors) or ""))
+        if s then M.ssh_hint(lines) end
         if config.options.project.open_output == "on_failure" then show(o.buf) end
         if errors > 0 and config.options.project.open_quickfix then
           local cur = vim.api.nvim_get_current_win()

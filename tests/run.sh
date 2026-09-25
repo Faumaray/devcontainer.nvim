@@ -2,8 +2,8 @@
 # Usage: NVIM=/path/to/nvim [PLUGINS=/dir/with/plugins] [OVERSEER=/path/to/overseer.nvim] tests/run.sh
 # $PLUGINS holds overseer.nvim, conform.nvim, nvim-lint, neotest, nvim-nio, plenary.nvim,
 # snacks.nvim, telescope.nvim, toggleterm.nvim and fidget.nvim (missing ones are skipped).
-# The e2e suites need root (mount namespaces), python3, git and clangd; the project suite also
-# needs cmake, ninja, a C++ compiler and cargo.
+# The e2e suites need root (mount namespaces), python3, git, clangd and ssh-agent; the project
+# suite also needs cmake, ninja, a C++ compiler and cargo.
 set -e
 cd "$(dirname "$0")/.."
 NVIM=${NVIM:-nvim}

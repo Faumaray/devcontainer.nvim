@@ -104,9 +104,10 @@ customizations = true                   *devcontainer-option-customizations*
     Read `customizations["devcontainer.nvim"]` from a trusted
     devcontainer.json, see |devcontainer-customizations|.
 
-git = { ssh_agent = true, gitconfig = true }       *devcontainer-option-git*
-    See |devcontainer-git|. `gitconfig` may also be the path of the file to
-    copy.
+git = { ssh_agent = true, gitconfig = true, known_hosts = true }
+                                                   *devcontainer-option-git*
+    See |devcontainer-git|. `gitconfig` and `known_hosts` may also be the
+    path of the file to copy.
 
 dotfiles                                      *devcontainer-option-dotfiles*
     `{ repository = nil, target_path = "~/dotfiles", install_command = nil }`
@@ -152,6 +153,12 @@ lsp                                                *devcontainer-option-lsp*
                           `--compile-commands-dir` / `compilationDatabasePath`
                           follow the active build dir, see
                           |devcontainer-compile-commands|
+    install_tools = "ask" clangd missing in the container of a C/C++
+                          workspace: offer to install clangd, clang-tidy and
+                          clang-format ("ask"), install them (true) or not
+                          (false), see |devcontainer-install-tools|
+    llvm_version = nil    LLVM major version to install (nil = the latest
+                          stable release)
 
 project                                        *devcontainer-option-project*
     runner = "auto"       "auto" (overseer.nvim when installed),
@@ -222,6 +229,9 @@ Container ~
 :Devcontainer info                Attached containers, servers, ports,
                                   profile and the current project.
 :Devcontainer forget              Forget the "always / never start" answer.
+:Devcontainer install [clangd]    Install clangd, clang-tidy and clang-format
+                                  in the container
+                                  (|devcontainer-install-tools|).
 
 Project (CMake or Cargo, detected from the current file) ~
 :Devcontainer configure [args]    `cmake --preset` / `cmake -S . -B ...`,
@@ -332,6 +342,19 @@ project are followed; others are kept. `lsp.follow_build_dir = false` keeps
 what the config says. Without the argument clangd finds the
 compile_commands.json that is symlinked into the project root.
 
+                                                  *devcontainer-install-tools*
+When a C/C++ workspace (CMakeLists.txt, compile_commands.json, meson.build,
+.clangd, or an open C/C++ file) is attached to a container without clangd,
+you're asked whether to install clangd, clang-tidy and clang-format
+(`lsp.install_tools`); `:Devcontainer install` does it any time. As root:
+Debian/Ubuntu get the latest stable LLVM from apt.llvm.org (llvm.sh, or
+`lsp.llvm_version`), linked by their plain names in /usr/local/bin, or the
+distribution's packages when apt.llvm.org doesn't support the release;
+dnf/yum, zypper, apk and pacman systems get the distribution's packages.
+clangd then restarts in the container. Only the running container changes:
+after a rebuild you're asked again ("Never" is remembered per project); add
+the tools to the image to keep them.
+
 ==============================================================================
 7. CONTAINER-ONLY FILES                              *devcontainer-remote-fs*
 
@@ -404,15 +427,26 @@ tunnelled.
 11. GIT, SSH AGENT AND DOTFILES                            *devcontainer-git*
 
 SSH agent (`git.ssh_agent`): new containers get SSH_AUTH_SOCK pointing at
-your agent. On Linux, a folder in Neovim's state dir is mounted and Neovim
-serves a socket in it that relays to your current $SSH_AUTH_SOCK, so the
-container still starts after the agent socket moved; the agent is available
-while Neovim runs. The container user needs your uid (the devcontainer CLI
-remaps it). On macOS Docker Desktop's /run/host-services/ssh-auth.sock is
-mounted. Existing containers need a rebuild.
+your agent, in shells, builds, language servers and the lifecycle commands
+the devcontainer CLI runs. On Linux, a folder in Neovim's state dir is
+mounted and Neovim serves a socket in it that relays to its $SSH_AUTH_SOCK,
+so the container still starts after the agent socket moved; the agent is
+available while Neovim runs. All Neovims share the socket: the first one
+serves it, another takes over when it exits. The container user needs your
+uid (the devcontainer CLI remaps it). On macOS Docker Desktop's
+/run/host-services/ssh-auth.sock is mounted. Existing containers need a
+rebuild.
+
+known_hosts (`git.known_hosts`): hosts from ~/.ssh/known_hosts are added to
+the container user's known_hosts; a build can't answer ssh's "continue
+connecting?".
 
 gitconfig (`git.gitconfig`): ~/.gitconfig is copied into containers that
 don't have one.
+
+When git over SSH fails in a build, `:checkhealth devcontainer` shows what
+tasks in the container see: which Neovim relays the agent, whether it is
+reachable, its number of keys, and whether there is a known_hosts.
 
                                                       *devcontainer-dotfiles*
 Dotfiles (`dotfiles.repository`, "owner/repo" or a git URL): cloned to

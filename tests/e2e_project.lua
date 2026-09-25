@@ -12,6 +12,7 @@ local E = "/tmp/dc-proj"
 vim.fn.delete(E, "rf")
 vim.fn.mkdir(E .. "/bin", "p")
 vim.env.XDG_DATA_HOME = E .. "/data"
+vim.env.XDG_STATE_HOME = E .. "/state"
 
 local function write(path, text)
   vim.fn.mkdir(vim.fs.dirname(path), "p")
@@ -32,6 +33,22 @@ vim.uv.fs_chmod(E .. "/bin/docker", 493)
 vim.env.FAKE_DOCKER_LOG = E .. "/docker.log"
 vim.env.FAKE_DOCKER_UNIQUE = "1"
 local binds = {}
+
+-- a real ssh-agent with a key; its relay dir is bind-mounted like git.agent_mount() does
+local have_ssh = vim.fn.executable("ssh-agent") == 1 and vim.fn.executable("ssh-add") == 1
+local agent_pid
+if have_ssh then
+  local sock = E .. "/agent.sock"
+  agent_pid = tonumber((vim.system({ "ssh-agent", "-s", "-a", sock }, { text = true }):wait().stdout or "")
+    :match("SSH_AGENT_PID=(%d+)"))
+  vim.system({ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "e2e-key", "-f", E .. "/id_e2e" }):wait()
+  vim.system({ "ssh-add", "-q", E .. "/id_e2e" }, { env = { SSH_AUTH_SOCK = sock } }):wait()
+  vim.env.SSH_AUTH_SOCK = sock
+  local dir = require("devcontainer.git").host_agent_dir()
+  vim.fn.mkdir(dir, "p", 448)
+  vim.fn.mkdir("/tmp/devcontainer-nvim-ssh", "p")
+  table.insert(binds, dir .. ":/tmp/devcontainer-nvim-ssh")
+end
 
 local failures = 0
 local function check(name, cond, detail)
@@ -108,7 +125,14 @@ add_executable(sgsn_app src/main.cpp)
 target_include_directories(sgsn_app PRIVATE include)
 enable_testing()
 add_test(NAME smoke COMMAND sgsn_app)
-]])
+]] .. (have_ssh and [[
+# like FetchContent from a private repository over SSH: configure needs the agent
+execute_process(COMMAND ssh-add -l RESULT_VARIABLE ssh_rc OUTPUT_VARIABLE ssh_out ERROR_VARIABLE ssh_err)
+if(NOT ssh_rc EQUAL 0)
+  message(FATAL_ERROR "no SSH agent in configure (${ssh_rc}): ${ssh_out}${ssh_err}")
+endif()
+file(WRITE ${CMAKE_BINARY_DIR}/ssh-agent.txt "${ssh_out}")
+]] or ""))
 local GOOD_CPP = [[
 #include <cstdio>
 #include <unistd.h>
@@ -180,6 +204,19 @@ check("cmake: compile_commands.json linked for clangd",
   vim.uv.fs_readlink(CM .. "/compile_commands.json") == "build/Debug/compile_commands.json")
 check("cmake: compile database has container paths", (read(CM .. "/compile_commands.json") or ""):find(CM_REMOTE .. "/src/main.cpp", 1, true) ~= nil)
 check("cmake: targets for completion", vim.tbl_contains(require("devcontainer.project").complete_targets("sgsn"), "sgsn_app"))
+if have_ssh then
+  check("ssh: configure in the container used the host's agent", (read(CM .. "/build/Debug/ssh-agent.txt") or ""):find("e2e-key", 1, true) ~= nil,
+    read(CM .. "/build/Debug/ssh-agent.txt"))
+  local health = {}
+  local orig = vim.health
+  vim.health = setmetatable({}, { __index = function(_, k)
+    return function(msg) table.insert(health, k .. ": " .. msg) end
+  end })
+  pcall(require("devcontainer.health").check_ssh, s)
+  vim.health = orig
+  check("ssh: checkhealth reports what tasks see", vim.tbl_contains(health, "ok: tasks in the container reach the SSH agent (1 key)")
+    and vim.tbl_contains(health, ("ok: SSH agent relay: this Neovim -> %s"):format(vim.env.SSH_AUTH_SOCK)), health)
+end
 if have_clangd then
   local def
   check("clangd: restarted after the first configure, uses the build dir's database", wait(20000, function()
@@ -318,5 +355,6 @@ else
   io.stdout:write("skip overseer checks (set OVERSEER=/path/to/overseer.nvim)\n")
 end
 
+if agent_pid then vim.uv.kill(agent_pid, 15) end
 io.stdout:write(failures == 0 and "\nall project e2e checks passed\n" or ("\n%d project e2e checks failed\n"):format(failures))
 os.exit(failures == 0 and 0 or 1)

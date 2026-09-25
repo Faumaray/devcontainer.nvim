@@ -222,6 +222,7 @@ function M.rewrite(cfg)
   new._devcontainer_cdb = cdb or override_cdb
   if not argv then
     local fallback = opts(session.local_folder).fallback
+    vim.schedule(function() require("devcontainer.tools").offer(session) end)
     if not session.warned[name] then
       session.warned[name] = true
       log.warn(("%s not found in container %s — %s"):format(
@@ -372,6 +373,8 @@ end
 
 -- folder -> the move in progress: its clients are still exiting
 local moves = {}
+-- a moved client still running after kill_after ms is killed; after give_up ms the move goes ahead
+M.move_timeouts = { kill_after = 3000, give_up = 5000 }
 
 --- Wait for the stopped clients to exit (killed after 3s), then start them again for their
 --- buffers. Each config goes through the patched vim.lsp.start, so it lands wherever it belongs now.
@@ -418,14 +421,22 @@ function M.start_clients(entries, after, folder)
     -- is_stopped() is true as soon as stop() was called; until the client is gone it is still
     -- attached, and requests to its buffers would wait for the exiting server too
     local pending = vim.tbl_filter(function(e) return vim.lsp.get_client_by_id(e.client.id) ~= nil end, entries)
-    if #pending > 0 and waited < 3000 then return end
+    local t = M.move_timeouts
+    if #pending > 0 and waited < t.kill_after then return end
     if #pending > 0 and not killed then
       killed = true
       -- stop(true) is a no-op on 0.11 for a client that is already stopping
       for _, e in ipairs(pending) do pcall(function() e.client.rpc.terminate() end) end
     end
-    if #pending > 0 and waited < 5000 then return end
+    if #pending > 0 and waited < t.give_up then return end
     move.cancel()
+    -- still there (a server that ignores the kill, a wrapper whose child keeps the pipes open): at
+    -- least take it off its buffers, so their requests don't wait for it
+    for _, e in ipairs(pending) do
+      for _, buf in ipairs(vim.tbl_keys(e.client.attached_buffers or {})) do
+        pcall(vim.lsp.buf_detach_client, buf, e.client.id)
+      end
+    end
 
     for _, e in ipairs(entries) do
       local host_cmd = host_cmd_of(e.config)

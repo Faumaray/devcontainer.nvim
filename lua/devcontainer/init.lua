@@ -202,6 +202,9 @@ function M.up(opts)
       M._teardown(existing)
     end
 
+    -- serve the agent before the container starts: the CLI runs lifecycle commands during `up`
+    if o.git and o.git.ssh_agent and vim.fn.has("mac") == 0 then require("devcontainer.git").start_agent_relay() end
+
     local backend_name, backend = pick_backend(o)
     local name = conf.name or vim.fs.basename(root)
     log.info(("%s %s (%s backend, progress: :Devcontainer log)"):format(
@@ -240,6 +243,7 @@ function M.up(opts)
       if type(cmd) == "table" and type(cmd[1]) == "string" then vim.list_extend(bins, { cmd[1], vim.fs.basename(cmd[1]) }) end
     end
     table.insert(bins, o.project.debug.command[1])
+    vim.list_extend(bins, require("devcontainer.tools").bins())
     vim.list_extend(bins, require("devcontainer.ports").RELAYS)
     session:prefetch(bins)
 
@@ -264,6 +268,7 @@ function M.up(opts)
     registry.register(session)
     log.info(("attached to %s: %s -> %s"):format(session.name, root, session.remote_folder))
     lsp.restart(root, entries)
+    require("devcontainer.tools").offer(session)
     reload_unread(session)
     require("devcontainer.ports").start(session)
     emit("DevcontainerAttached", event_data(session))
@@ -598,6 +603,15 @@ end
 --- Define profiles at runtime, e.g. from a project's .nvim.lua (:help 'exrc').
 function M.add_profiles(defs)
   require("devcontainer.profiles").add(defs)
+end
+
+--- Install a tool set (default: clangd, clang-tidy and clang-format) in the current container.
+---@param name? string
+function M.install_tools(name)
+  registry.pick(function(s)
+    if not s then return log.warn("no devcontainer attached — run :Devcontainer up") end
+    require("devcontainer.tools").install(s, name or "clangd")
+  end, "Install in devcontainer")
 end
 
 --- Forget the remembered autostart answer for the current project.
