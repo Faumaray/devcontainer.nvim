@@ -148,6 +148,8 @@ require("devcontainer").setup({
   },
   terminal = {
     provider = "builtin",  -- shell/exec/run terminals: "builtin" | "snacks" | "toggleterm" | function
+    cwd = "project",       -- where shell / exec start: "project" (the file's CMake / Cargo / git root,
+                           -- else the workspace) | "workspace" | "file" (the file's directory)
   },
   ports = {
     forward = true,        -- forward devcontainer.json forwardPorts when attaching
@@ -269,8 +271,8 @@ basename inside the container. Arguments that contain your workspace path (for e
 | `:Devcontainer down` | remove the container (`docker compose down` for compose configs), after asking |
 | `:Devcontainer init` | add a devcontainer config to the project from a template |
 | `:Devcontainer config` | open devcontainer.json |
-| `:Devcontainer shell` | login shell of the remote user in a terminal |
-| `:Devcontainer exec <cmd>` | run a command in the container (in the current file's directory) |
+| `:Devcontainer shell` | login shell of the remote user, in the current file's project root (`terminal.cwd`) |
+| `:Devcontainer exec <cmd>` | run a command in the container, in the same directory |
 | `:Devcontainer files [dir]` | find and open container-only files (headers, SDKs, packages) |
 | `:Devcontainer ports` | forwarded ports: open in the browser, copy the address, stop |
 | `:Devcontainer forward <port\|host:port> [local]` | forward a port |
@@ -447,7 +449,9 @@ require("devcontainer.integrations.lint").setup()           -- after linters_by_
 Formatters and linters then run inside the buffer's container (and on the host elsewhere, or when
 the tool isn't in the image). `setup({ formatters = { "clang_format" }, exclude = { ... } })`
 limits which ones; `.wrap(name)` wraps a single one. Container paths in linter output are mapped
-back before nvim-lint's parser sees them.
+back before nvim-lint's parser sees them. A formatter or linter without a `cwd` of its own runs in
+the file's project root (its CMake / Cargo / git root, else the workspace folder), not in Neovim's
+cwd; language servers in the container run in their `root_dir` unless they have a `cmd_cwd`.
 
 ### Terminals
 

@@ -96,6 +96,31 @@ local function start_path()
   return vim.fn.getcwd()
 end
 
+local function inside(path, folder)
+  return path == folder or path:sub(1, #folder + 1) == folder .. "/"
+end
+
+--- Where a command for `path` runs when nothing says otherwise: the root of its CMake / Cargo
+--- project, else its git root (inside its devcontainer's workspace), else the workspace folder.
+--- Host path; nil outside of any of them.
+---@param path? string  file or directory (default: current file, else cwd)
+---@return string?
+function M.root_for(path)
+  path = path or start_path()
+  if vim.fn.isdirectory(path) == 0 then path = vim.fs.dirname(path) end
+  local session = registry.find(path)
+  local boundary = session and session.local_folder or vim.fs.root(path, ".git")
+  local best
+  for _, p in ipairs(M.providers) do
+    local ok, root = pcall(p.detect, path, boundary)
+    if ok and root and (not best or #root > #best) then best = root end
+  end
+  if best then return best end
+  local git = vim.fs.root(path, ".git")
+  if not session then return git end
+  return git and inside(git, session.local_folder) and git or session.local_folder
+end
+
 --- Project around `path` (default: current file, else cwd).
 ---@return devcontainer.ProjectCtx?
 function M.detect(path)

@@ -431,14 +431,28 @@ end
 
 local LOGIN_SHELL = 'shell="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f7)"; exec "${shell:-/bin/sh}" -l'
 
+--- Host directory where a terminal for `path` (a file, else Neovim's cwd) starts (terminal.cwd).
+local function terminal_dir(s, path)
+  local mode = config.get(s.local_folder).terminal.cwd
+  if mode == "workspace" then return s.local_folder end
+  path = path or vim.fn.getcwd()
+  if mode == "file" then return vim.fn.isdirectory(path) == 1 and path or vim.fs.dirname(path) end
+  return require("devcontainer.project").root_for(path) or s.local_folder
+end
+
+local function current_file()
+  local name = vim.api.nvim_buf_get_name(0)
+  if vim.bo.buftype == "" and name ~= "" then return name end
+end
+
 --- Open a terminal running `cmd` (or the user's login shell) in the container.
 function M.exec(cmd)
-  local dir = vim.fn.expand("%:p:h")
+  local file = current_file()
   registry.pick(function(s)
     if not s then return log.warn("no devcontainer attached — run :Devcontainer up") end
     local interactive = not (cmd and vim.trim(cmd) ~= "")
     local argv = interactive and { "/bin/sh", "-c", LOGIN_SHELL } or { "/bin/sh", "-lc", cmd }
-    local cwd = (dir ~= "" and s:remote_path(dir)) or s.remote_folder
+    local cwd = s:remote_path(terminal_dir(s, file)) or s.remote_folder
     require("devcontainer.terminal").open(s:exec_argv(argv, { tty = true, cwd = cwd }), {
       cwd = s.local_folder,
       title = interactive and s.name or cmd,
@@ -478,8 +492,17 @@ end
 ---@return string[]? argv  nil when no devcontainer is attached
 function M.shell_cmd(opts)
   opts = opts or {}
-  local argv, s = M.wrap_cmd({ "/bin/sh", "-c", LOGIN_SHELL }, { path = opts.path, cwd = opts.cwd, tty = true })
-  return s and argv or nil
+  local path = opts.path or current_file()
+  local s
+  if opts.path then
+    s = registry.find(opts.path)
+  else
+    s = (path and registry.find(path)) or registry.current()
+  end
+  if not s then return nil end
+  local argv = M.wrap_cmd({ "/bin/sh", "-c", LOGIN_SHELL },
+    { path = s.local_folder, cwd = opts.cwd or terminal_dir(s, path), tty = true })
+  return argv
 end
 
 function M.info()

@@ -50,7 +50,9 @@ local function exec_args(session, base, ctx, args)
   if type(args) == "function" then args = args(base, ctx) end
   local env = base.env
   if type(env) == "function" then env = env(base, ctx) end
-  local host_cwd = base.cwd and base.cwd(base, ctx) or vim.fn.getcwd()
+  -- the formatter's own cwd, else its project's root (not Neovim's cwd: a subfolder, or none of the container)
+  local host_cwd = base.cwd and base.cwd(base, ctx) or require("devcontainer.project").root_for(ctx.filename)
+    or vim.fn.getcwd()
   local values = {
     FILENAME = session:remote_path(ctx.filename) or ctx.filename,
     DIRNAME = session:remote_path(ctx.dirname) or ctx.dirname,
