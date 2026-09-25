@@ -34,7 +34,7 @@ if have apt-get; then
   if wget -qO "$tmp/llvm.sh" https://apt.llvm.org/llvm.sh; then
     [ -n "$V" ] || V=$(sed -n 's/^CURRENT_LLVM_STABLE=\([0-9][0-9]*\).*/\1/p' "$tmp/llvm.sh" | head -n 1)
     if [ -n "$V" ] && bash "$tmp/llvm.sh" "$V" \
-      && apt-get install -y --no-install-recommends "clang-tidy-$V" "clang-format-$V"; then
+      && apt-get update -y && apt-get install -y --no-install-recommends "clang-tidy-$V" "clang-format-$V"; then
       link "$V"
       rm -rf "$tmp"
       exit 0
@@ -42,6 +42,7 @@ if have apt-get; then
   fi
   rm -rf "$tmp"
   echo "apt.llvm.org didn't work here: installing the distribution's packages" >&2
+  apt-get update -y
   apt-get install -y --no-install-recommends clangd clang-tidy clang-format
 elif have dnf; then
   dnf install -y clang-tools-extra
