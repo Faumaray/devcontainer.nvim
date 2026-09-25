@@ -78,8 +78,9 @@ check("tools are container-only", vim.fn.executable("upfmt") == 0 and session:wh
 -- conform.nvim ----------------------------------------------------------------------------------
 if have("conform.nvim") then
   local conform = require("conform")
-  conform.setup({ formatters_by_ft = { text = { "upfmt" } }, formatters = { upfmt = { command = "upfmt" } } })
+  -- set up first, conform configured afterwards (lazy loaders, distributions): still in the container
   require("devcontainer.integrations.conform").setup()
+  conform.setup({ formatters_by_ft = { text = function() return { "upfmt" } end }, formatters = { upfmt = { command = "upfmt" } } })
   vim.bo[main_buf].filetype = "text"
   local done, err
   conform.format({ bufnr = main_buf, async = true }, function(e) done, err = true, e end)
@@ -276,7 +277,8 @@ wait(10000, function() -- filled asynchronously on newer Neovim
   return health:find("attached containers", 1, true) ~= nil
 end)
 check("checkhealth reports the relay and the integrations", health:find("port forwarding relay", 1, true) ~= nil
-  and health:find("conform.nvim found", 1, true) ~= nil and not health:find("ERROR", 1, true), health)
+  and (not have("conform.nvim") or health:find("conform.nvim: formatters in the container of their buffer", 1, true) ~= nil)
+  and not health:find("ERROR", 1, true), health)
 
 io.stdout:write(failures == 0 and "\nall integration e2e checks passed\n" or ("\n%d integration e2e checks failed\n"):format(failures))
 os.exit(failures == 0 and 0 or 1)

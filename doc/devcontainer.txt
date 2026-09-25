@@ -490,11 +490,14 @@ the host are copied in first.
 
 conform.nvim ~
 >lua
-    require("devcontainer.integrations.conform").setup()  -- after conform.setup()
+    require("devcontainer.integrations.conform").setup()
 <
 Formatters run in the buffer's container, on the host elsewhere or when the
-tool isn't in the image. `setup({ formatters = { ... }, exclude = { ... } })`
-limits them; `.wrap(name)` wraps one.
+tool isn't in the image. `setup()` hooks conform's formatter lookup: call it
+before or after conform.setup(); formatters defined later are covered too.
+`setup({ formatters = { ... }, exclude = { ... } })` limits them;
+`.wrap(name)` wraps one. Without conform.nvim (or nvim-lint, for its
+`setup()`) it warns and does nothing.
 
 nvim-lint ~
 >lua

@@ -43,8 +43,21 @@ function M.check()
   plugin("overseer", "lua/overseer/init.lua", "overseer.nvim", "project tasks run as overseer tasks; templates run in the container")
   plugin("lualine", "lua/lualine.lua", "lualine.nvim", "component: lualine_x = { 'devcontainer' }")
   plugin("rustaceanvim", "lua/rustaceanvim/init.lua", "rustaceanvim", "executor: require('devcontainer.integrations.rustaceanvim').executor")
-  plugin("conform", "lua/conform/init.lua", "conform.nvim", "require('devcontainer.integrations.conform').setup()")
-  plugin("lint", "lua/lint.lua", "nvim-lint", "require('devcontainer.integrations.lint').setup()")
+  -- installed, and set up?
+  local function integration(mod, file, name, int, what)
+    if not (package.loaded[mod] or #vim.api.nvim_get_runtime_file(file, false) > 0) then
+      return h.info(("%s not installed"):format(name))
+    end
+    local m = package.loaded["devcontainer.integrations." .. int]
+    if m and m.active then
+      h.ok(("%s: %s in the container of their buffer"):format(name, what))
+    else
+      h.warn(("%s found, but its %s run on the host"):format(name, what),
+        { ("require('devcontainer.integrations.%s').setup()"):format(int) })
+    end
+  end
+  integration("conform", "lua/conform/init.lua", "conform.nvim", "conform", "formatters")
+  integration("lint", "lua/lint.lua", "nvim-lint", "lint", "linters")
   plugin("neotest", "lua/neotest/init.lua", "neotest", "default_strategy = 'devcontainer'")
   local runner = require("devcontainer.runner")
   h.info("project runner: " .. runner.backend())

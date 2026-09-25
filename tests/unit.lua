@@ -663,31 +663,69 @@ test("wrap_cmd: exec argv with mapped paths, unchanged without a container", fun
 end)
 
 test("conform: formatters run in the container, host config outside", function()
-  local util = { merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end }
-  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = { cpp = { "clang_format" }, py = { { "black" } } } }
-  package.loaded["conform"], package.loaded["conform.util"] = conform, util
+  -- conform's own lookup: built-in definition + the user's override
+  local conform = { formatters = { black = { prepend_args = { "-q" } } }, formatters_by_ft = {} }
+  function conform.get_formatter_config(name, bufnr)
+    local override = conform.formatters[name]
+    if type(override) == "function" then override = override(bufnr) end
+    if type(override) == "table" and override.inherit == false then return override end
+    local ok, builtin = pcall(require, "conform.formatters." .. name)
+    if not ok then return override end
+    return override and vim.tbl_deep_extend("force", builtin, override) or builtin
+  end
+  package.loaded["conform"], package.loaded["conform.util"] = conform, {
+    merge_formatter_configs = function(a, b) return vim.tbl_deep_extend("force", a, b) end,
+  }
   package.loaded["conform.formatters.clang_format"] = { command = "clang-format", args = { "--assume-filename", "$FILENAME" } }
   package.loaded["conform.formatters.black"] = { command = "black", args = { "--stdin-filename", "$FILENAME", "-" } }
-  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format" })
+  package.loaded["conform.formatters.stylua"] = { command = "stylua", args = { "-" } }
+  local integ = require("devcontainer.integrations.conform")
+  local s = fake_session({ ["clang-format"] = "/usr/bin/clang-format", stylua = "/usr/bin/stylua" })
   session_mod.register(s)
-  require("devcontainer.integrations.conform").setup()
-  eq(type(conform.formatters.clang_format), "function")
-  eq(type(conform.formatters.black), "function")
+  eq(integ.setup(), true) -- before the formatters are configured: fine
+  conform.formatters_by_ft = { cpp = function() return { "clang_format" } end } -- functions too
   local buf = scratch_named("/home/me/proj/src/a.cpp")
-  local cfg = conform.formatters.clang_format(buf)
-  eq({ cfg.command, cfg.inherit }, { "docker", false })
+  local cfg = conform.get_formatter_config("clang_format", buf)
+  eq({ cfg.command, cfg.inherit, cfg._devcontainer }, { "docker", false, s.key })
   local args = cfg.args(cfg, { filename = "/home/me/proj/src/a.cpp", dirname = "/home/me/proj/src", buf = buf })
   eq(vim.list_slice(args, #args - 2), { "/usr/bin/clang-format", "--assume-filename", "/workspaces/proj/src/a.cpp" })
   eq(args[1], "exec")
-  -- black isn't in the container: host definition (with the user's override merged)
-  local b = conform.formatters.black(buf)
-  eq({ b.command, b.inherit }, { "black", false })
-  local out = scratch_named("/elsewhere/a.cpp")
-  eq(conform.formatters.clang_format(out).command, "clang-format")
-  require("devcontainer.integrations.conform").setup() -- idempotent
-  eq(conform.formatters.clang_format(buf).command, "docker")
+  -- black isn't in the container: the host definition (with the user's override)
+  local b = conform.get_formatter_config("black", buf)
+  eq({ b.command, b.prepend_args }, { "black", { "-q" } })
+  -- defined after setup()
+  conform.formatters.my_fmt = { command = "stylua", args = { "-" } }
+  eq(conform.get_formatter_config("my_fmt", buf).command, "docker", "a formatter defined later")
+  -- Lua formatters, and buffers outside the workspace, stay as they are
+  conform.formatters.lua_fmt = { format = function() end }
+  eq(conform.get_formatter_config("lua_fmt", buf).command, nil)
+  eq(conform.get_formatter_config("clang_format", scratch_named("/elsewhere/a.cpp")).command, "clang-format")
+  -- exclude / only; setup() again doesn't wrap twice
+  integ.setup({ exclude = { "clang_format" } })
+  eq(conform.get_formatter_config("clang_format", buf).command, "clang-format", "excluded")
+  integ.setup({ formatters = { "stylua" } })
+  eq({ conform.get_formatter_config("clang_format", buf).command, conform.get_formatter_config("stylua", buf).command },
+    { "clang-format", "docker" }, "only the listed ones")
+  integ.setup()
+  eq(conform.get_formatter_config("clang_format", buf).args(cfg, { filename = "/home/me/proj/src/a.cpp",
+    dirname = "/home/me/proj/src", buf = buf })[1], "exec", "wrapped once")
+  -- per formatter
+  conform.formatters.wrapped = integ.wrap("clang_format", { command = "clang-format" })
+  eq(conform.get_formatter_config("wrapped", buf).command, "docker")
   session_mod.unregister(s)
   package.loaded["conform"], package.loaded["conform.util"] = nil, nil
+end)
+
+test("conform / nvim-lint setup without the plugin: a warning, no error", function()
+  package.loaded["lint"], package.loaded["conform"] = nil, nil
+  local orig = package.preload
+  local ok1, r1 = pcall(require("devcontainer.integrations.lint").setup)
+  eq({ ok1, r1 }, { true, false })
+  -- conform's integration was set up above (with the stub); a fresh copy sees no conform.nvim
+  package.loaded["devcontainer.integrations.conform"] = nil
+  local ok2, r2 = pcall(require("devcontainer.integrations.conform").setup)
+  eq({ ok2, r2 }, { true, false })
+  eq(package.preload, orig)
 end)
 
 test("nvim-lint: linters run in the container, output mapped back", function()

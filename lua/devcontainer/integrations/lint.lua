@@ -91,11 +91,21 @@ function M.wrap(name, original)
   return fn
 end
 
+--- setup() was called (and nvim-lint is installed)
+M.active = false
+
 --- Wrap linters: every one in `linters_by_ft` ("*", the default) or the given list, minus `exclude`.
+--- Without nvim-lint it warns and does nothing.
 ---@param opts? { linters?: "*"|string[], exclude?: string[] }
+---@return boolean ok
 function M.setup(opts)
   opts = opts or {}
-  local lint = require("lint")
+  local found, lint = pcall(require, "lint")
+  if not found then
+    log.warn("devcontainer: nvim-lint is not installed; the nvim-lint integration stays off")
+    return false
+  end
+  M.active = true
   local names = {}
   if opts.linters == nil or opts.linters == "*" then
     for _, list in pairs(lint.linters_by_ft or {}) do
@@ -109,6 +119,7 @@ function M.setup(opts)
     local ok, original = pcall(function() return lint.linters[name] end)
     if ok and original then lint.linters[name] = M.wrap(name, original) end
   end
+  return true
 end
 
 return M

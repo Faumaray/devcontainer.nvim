@@ -448,16 +448,18 @@ scripts that only exist on the host (neotest-python's `neotest.py`, ...) are cop
 ### conform.nvim and nvim-lint
 
 ```lua
-require("conform").setup({ formatters_by_ft = { cpp = { "clang_format" }, python = { "ruff_format" } } })
-require("devcontainer.integrations.conform").setup()        -- after conform.setup()
+require("devcontainer.integrations.conform").setup()        -- before or after conform.setup()
 
 require("lint").linters_by_ft = { python = { "ruff", "mypy" } }
 require("devcontainer.integrations.lint").setup()           -- after linters_by_ft
 ```
 
 Formatters and linters then run inside the buffer's container (and on the host elsewhere, or when
-the tool isn't in the image). `setup({ formatters = { "clang_format" }, exclude = { ... } })`
-limits which ones; `.wrap(name)` wraps a single one. Container paths in linter output are mapped
+the tool isn't in the image). The conform integration hooks conform's formatter lookup, so it also
+covers formatters defined later (`formatters_by_ft` functions, distributions and plugins adding
+their own). `setup({ formatters = { "clang_format" }, exclude = { ... } })` limits which ones;
+`.wrap(name)` wraps a single one. Without the plugin installed, `setup()` warns and does nothing;
+`:checkhealth devcontainer` shows whether each integration is set up. Container paths in linter output are mapped
 back before nvim-lint's parser sees them. A formatter or linter without a `cwd` of its own runs in
 the file's project root (its CMake / Cargo / git root, else the workspace folder), not in Neovim's
 cwd; language servers in the container run in their `root_dir` unless they have a `cmd_cwd`.

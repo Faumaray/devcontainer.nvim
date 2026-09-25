@@ -1,12 +1,14 @@
 --- conform.nvim: run formatters inside the devcontainer of the buffer (clang-format, rustfmt,
 --- ruff, prettier, ... installed in the image, not on the host).
 ---
----   require("conform").setup({ formatters_by_ft = { cpp = { "clang_format" }, python = { "ruff_format" } } })
----   require("devcontainer.integrations.conform").setup()   -- after conform.setup()
+---   require("devcontainer.integrations.conform").setup()
 ---
---- or per formatter:  require("conform").formatters.clang_format = require("devcontainer.integrations.conform").wrap("clang_format")
+--- It hooks conform's formatter lookup, so it works before or after conform.setup() and for
+--- formatters defined later (formatters_by_ft functions, plugins adding their own). Or per
+--- formatter:  require("conform").formatters.clang_format = require("devcontainer.integrations.conform").wrap("clang_format")
 ---
---- Outside an attached workspace the formatter runs on the host as usual.
+--- Outside an attached workspace, for Lua formatters, and for tools the image doesn't have, the
+--- formatter runs on the host as usual.
 local log = require("devcontainer.log")
 local registry = require("devcontainer.session")
 
@@ -14,6 +16,9 @@ local M = {}
 
 local wrappers = setmetatable({}, { __mode = "k" }) -- our functions, to avoid wrapping twice
 local warned = {}
+
+--- setup() was called (and conform is installed)
+M.active = false
 
 local function session_of(bufnr)
   local name = vim.api.nvim_buf_get_name(bufnr)
@@ -91,6 +96,7 @@ function M.in_container(session, name, base)
   end
   local cfg = {}
   for k, v in pairs(base) do cfg[k] = v end
+  cfg._devcontainer = session.key
   cfg.inherit = false
   cfg.command = session.docker
   cfg.env = nil
@@ -123,34 +129,42 @@ function M.wrap(name, original)
   return fn
 end
 
-local function collect(list, out)
-  if type(list) ~= "table" then return end
-  for _, v in ipairs(list) do
-    if type(v) == "string" then
-      out[v] = true
-    elseif type(v) == "table" then
-      collect(v, out)
-    end
-  end
+local settings = { only = nil, exclude = {} }
+
+local function wanted(name)
+  if settings.exclude[name] then return false end
+  return settings.only == nil or settings.only[name] == true
 end
 
---- Wrap formatters: every one named in `formatters_by_ft` and `conform.formatters` ("*", the
---- default) or the given list, minus `exclude`.
+--- Run formatters in the container of their buffer: every one ("*", the default) or the given
+--- list, minus `exclude`. Without conform.nvim it warns and does nothing.
 ---@param opts? { formatters?: "*"|string[], exclude?: string[] }
+---@return boolean ok
 function M.setup(opts)
   opts = opts or {}
-  local conform = require("conform")
-  local names = {}
-  if opts.formatters == nil or opts.formatters == "*" then
-    for _, list in pairs(conform.formatters_by_ft or {}) do collect(list, names) end
-    for name in pairs(conform.formatters or {}) do names[name] = true end
-  else
-    for _, n in ipairs(opts.formatters) do names[n] = true end
+  local ok, conform = pcall(require, "conform")
+  if not ok then
+    log.warn("devcontainer: conform.nvim is not installed; the conform integration stays off")
+    return false
   end
-  for _, n in ipairs(opts.exclude or {}) do names[n] = nil end
-  for name in pairs(names) do
-    conform.formatters[name] = M.wrap(name, conform.formatters[name])
+  settings.only = nil
+  if type(opts.formatters) == "table" then
+    settings.only = {}
+    for _, n in ipairs(opts.formatters) do settings.only[n] = true end
   end
+  settings.exclude = {}
+  for _, n in ipairs(opts.exclude or {}) do settings.exclude[n] = true end
+  if not M.active then
+    local orig = conform.get_formatter_config
+    conform.get_formatter_config = function(name, bufnr)
+      local cfg, err = orig(name, bufnr)
+      if type(cfg) ~= "table" or cfg._devcontainer or not wanted(name) then return cfg, err end
+      local session = session_of((bufnr == nil or bufnr == 0) and vim.api.nvim_get_current_buf() or bufnr)
+      return session and M.in_container(session, name, cfg) or cfg, err
+    end
+    M.active = true
+  end
+  return true
 end
 
 return M
