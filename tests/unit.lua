@@ -904,6 +904,32 @@ test("lsp.start_clients: waits for the clients to exit; a newer move takes over 
   eq(after, 1, "the superseded move's callback runs once, after the merged move")
 end)
 
+test("lsp.start_clients: a client that won't exit is killed, then taken off its buffers", function()
+  local buf = scratch_named("/moves/stuck/a.c")
+  local terminated, detached, calls = 0, {}, {}
+  local client = {
+    id = 4343, is_stopped = function() return true end, stop = function() end,
+    attached_buffers = { [buf] = true },
+    rpc = { terminate = function() terminated = terminated + 1 end },
+  }
+  local orig_get, orig_detach, orig_start = vim.lsp.get_client_by_id, vim.lsp.buf_detach_client, vim.lsp.start
+  vim.lsp.get_client_by_id = function(id) if id == client.id then return client end return orig_get(id) end
+  vim.lsp.buf_detach_client = function(b, id)
+    table.insert(detached, { b, id, #calls })
+    client.attached_buffers[b] = nil
+  end
+  vim.lsp.start = function(cfg, o) table.insert(calls, { cfg.name, o.bufnr }) end
+  lsp.move_timeouts = { kill_after = 200, give_up = 500 }
+  lsp.start_clients({ { client = client, config = { name = "srv", cmd = { vim.fn.exepath("sh") } }, bufs = { buf } } },
+    nil, "/moves/stuck")
+  vim.wait(2000, function() return #calls > 0 end)
+  lsp.move_timeouts = { kill_after = 3000, give_up = 5000 }
+  vim.lsp.get_client_by_id, vim.lsp.buf_detach_client, vim.lsp.start = orig_get, orig_detach, orig_start
+  eq(terminated, 1, "killed once")
+  eq(detached, { { buf, 4343, 0 } }, "detached before the new client starts")
+  eq(calls, { { "srv", buf } })
+end)
+
 test("lsp: --compile-commands-dir / compilationDatabasePath follow the active build dir", function()
   local root = tmp .. "/ccd"
   writef(root .. "/CMakeLists.txt", "")
