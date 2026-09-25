@@ -100,8 +100,11 @@ M.defaults = {
     -- clangd missing in the container of a C/C++ workspace: offer to install clangd, clang-tidy and
     -- clang-format ("ask"), install them right away (true) or not (false); :Devcontainer install
     install_tools = "ask",
-    -- LLVM major version to install from apt.llvm.org (nil = the latest stable release)
+    -- LLVM major version to install (nil = the newest: apt.llvm.org's current release, else PyPI's,
+    -- else the distribution's newest)
     llvm_version = nil,
+    -- apt.llvm.org mirror to use instead (e.g. your company's), like llvm.sh -m
+    llvm_mirror = nil,
   },
   -- :Devcontainer configure/build/run/test/clean/debug — run in the container when attached, else on the host
   project = {

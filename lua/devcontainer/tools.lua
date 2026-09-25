@@ -1,7 +1,7 @@
 --- Language tools missing in the container: when a C/C++ workspace is attached to a container
---- without clangd, offer to install clangd, clang-tidy and clang-format (latest LLVM from
---- apt.llvm.org on Debian/Ubuntu, the distribution's packages elsewhere). They are installed into
---- the running container, so after a rebuild they are offered again.
+--- without clangd, offer to install clangd, clang-tidy and clang-format (the newest there is:
+--- apt.llvm.org, PyPI wheels, the distribution's). They are installed into the running container,
+--- so after a rebuild they are offered again.
 local async = require("devcontainer.async")
 local config = require("devcontainer.config")
 local log = require("devcontainer.log")
@@ -9,60 +9,129 @@ local store = require("devcontainer.store")
 
 local M = {}
 
---- sh script, run as root: $1 = LLVM major version ("" = the latest stable release).
---- $DEVCONTAINER_BIN_DIR (default /usr/local/bin) gets the plain names of versioned binaries
---- ($DEVCONTAINER_ROOT prefixes the paths looked at, for tests).
+--- sh script, run as root: $1 = LLVM major version ("" = the latest release), $2 = apt.llvm.org
+--- mirror. Newest first:
+---  1. apt.llvm.org (Debian / Ubuntu): the release llvm.sh installs, but only clangd-N, clang-tidy-N
+---     and clang-format-N, and without add-apt-repository (it breaks when python3 isn't the
+---     distribution's)
+---  2. PyPI wheels (glibc systems) in a venv
+---  3. the distribution's newest versioned packages (apt), else its clang tools package
+--- Versioned binaries are linked by their plain names into $DEVCONTAINER_BIN_DIR (/usr/local/bin);
+--- $DEVCONTAINER_ROOT prefixes the system paths used, for tests.
 M.LLVM_SCRIPT = [[
-V="${1:-}"
+PIN="${1:-}"
+MIRROR="${2:-https://apt.llvm.org}"
 BIN="${DEVCONTAINER_BIN_DIR:-/usr/local/bin}"
 ROOT="${DEVCONTAINER_ROOT:-}"
+VENV="${DEVCONTAINER_LLVM_VENV:-/opt/devcontainer-nvim/llvm}"
+TOOLS="clangd clang-tidy clang-format"
 export DEBIAN_FRONTEND=noninteractive
 have() { command -v "$1" >/dev/null 2>&1; }
+say() { echo "devcontainer.nvim: $*" >&2; }
+fetch() { if have wget; then wget -qO "$2" "$1"; else curl -fsSL -o "$2" "$1"; fi; }
+osr() { sed -n "s/^$1=//p" "$ROOT/etc/os-release" 2>/dev/null | tr -d '"' | head -n 1; }
+# $BIN/<tool> -> the first of the dirs given that has it
 link() {
-  mkdir -p "$BIN"
-  for t in clangd clang-tidy clang-format; do
-    for c in "$ROOT/usr/lib/llvm-$1/bin/$t" "$ROOT/usr/bin/$t-$1"; do
-      if [ -x "$c" ]; then ln -sf "$c" "$BIN/$t"; break; fi
+  mkdir -p "$BIN" || return 1
+  for t in $TOOLS; do
+    found=
+    for d; do
+      if [ -x "$d/$t" ]; then ln -sf "$d/$t" "$BIN/$t"; found=1; break; fi
     done
+    [ -n "$found" ] || { say "$t missing after the installation"; return 1; }
   done
 }
-if have apt-get; then
-  apt-get update || exit 1
-  # what llvm.sh needs
-  apt-get install -y --no-install-recommends ca-certificates wget gnupg lsb-release software-properties-common || exit 1
-  tmp=$(mktemp -d)
-  if wget -qO "$tmp/llvm.sh" https://apt.llvm.org/llvm.sh; then
-    [ -n "$V" ] || V=$(sed -n 's/^CURRENT_LLVM_STABLE=\([0-9][0-9]*\).*/\1/p' "$tmp/llvm.sh" | head -n 1)
-    if [ -n "$V" ] && bash "$tmp/llvm.sh" "$V" \
-      && apt-get update -y && apt-get install -y --no-install-recommends "clang-tidy-$V" "clang-format-$V"; then
-      link "$V"
-      rm -rf "$tmp"
-      exit 0
+
+apt_llvm() {
+  have apt-get || return 1
+  have wget || have curl || apt-get install -y --no-install-recommends ca-certificates wget || return 1
+  code=$(osr UBUNTU_CODENAME)
+  [ -n "$code" ] || code=$(osr VERSION_CODENAME)
+  [ -n "$code" ] || { say "unknown release (no codename in /etc/os-release)"; return 1; }
+  v="$PIN"
+  if [ -z "$v" ]; then
+    tmp=$(mktemp) && fetch "$MIRROR/llvm.sh" "$tmp" \
+      && v=$(sed -n 's/^CURRENT_LLVM_STABLE=\([0-9][0-9]*\).*/\1/p' "$tmp" | head -n 1)
+    rm -f "$tmp"
+    [ -n "$v" ] || { say "can't read the current LLVM release from $MIRROR/llvm.sh"; return 1; }
+  fi
+  case "$code" in
+    sid|unstable|forky) code=unstable; suite="llvm-toolchain-$v" ;;
+    *) suite="llvm-toolchain-$code-$v" ;;
+  esac
+  fetch "$MIRROR/$code/dists/$suite/Release" /dev/null || { say "$MIRROR has no $code/$suite"; return 1; }
+  mkdir -p "$ROOT/etc/apt/trusted.gpg.d" "$ROOT/etc/apt/sources.list.d"
+  fetch "$MIRROR/llvm-snapshot.gpg.key" "$ROOT/etc/apt/trusted.gpg.d/apt.llvm.org.asc" || return 1
+  list="$ROOT/etc/apt/sources.list.d/apt.llvm.org-$v.list"
+  echo "deb $MIRROR/$code/ $suite main" > "$list"
+  if apt-get update -o Dir::Etc::sourcelist="$list" -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 \
+    && apt-get install -y --no-install-recommends "clangd-$v" "clang-tidy-$v" "clang-format-$v" \
+    && link "$ROOT/usr/lib/llvm-$v/bin"; then
+    say "installed LLVM $v from $MIRROR"
+    return 0
+  fi
+  rm -f "$list"
+  return 1
+}
+
+pypi() {
+  if ! have python3; then
+    if have apt-get; then apt-get install -y --no-install-recommends python3 python3-venv
+    elif have dnf; then dnf install -y python3
+    elif have yum; then yum install -y python3
+    elif have zypper; then zypper --non-interactive install python3
     fi
   fi
-  rm -rf "$tmp"
-  echo "apt.llvm.org didn't work here: installing the distribution's packages" >&2
-  apt-get update -y
-  apt-get install -y --no-install-recommends clangd clang-tidy clang-format
-elif have dnf; then
-  dnf install -y clang-tools-extra
-elif have yum; then
-  yum install -y clang-tools-extra
-elif have zypper; then
-  zypper --non-interactive install clang-tools
-elif have apk; then
-  apk add --no-cache clang-extra-tools
-elif have pacman; then
-  pacman -Sy --noconfirm clang
-else
-  echo "no supported package manager (apt-get, dnf, yum, zypper, apk, pacman)" >&2
-  exit 1
-fi]]
+  have python3 || return 1
+  if ! python3 -m venv --clear "$VENV"; then
+    have apt-get && apt-get install -y --no-install-recommends python3-venv && python3 -m venv --clear "$VENV" || return 1
+  fi
+  spec=
+  for t in $TOOLS; do spec="$spec $t${PIN:+==$PIN.*}"; done
+  "$VENV/bin/python" -m pip install --upgrade --only-binary=:all: $spec || return 1
+  dirs=
+  for p in clangd clang_tidy clang_format; do
+    dirs="$dirs $(find "$VENV" -type d -path "*/site-packages/$p/data/bin" | head -n 1)"
+  done
+  link $dirs || return 1
+  say "installed from PyPI into $VENV"
+}
+
+distro() {
+  if have apt-get; then
+    for n in $(apt-cache search --names-only '^clangd-[0-9]+$' 2>/dev/null | sed -n 's/^clangd-\([0-9][0-9]*\) .*/\1/p' | sort -rnu); do
+      if [ -z "$PIN" ] || [ "$n" = "$PIN" ]; then
+        if apt-cache show "clang-tidy-$n" "clang-format-$n" >/dev/null 2>&1 \
+          && apt-get install -y --no-install-recommends "clangd-$n" "clang-tidy-$n" "clang-format-$n" \
+          && link "$ROOT/usr/lib/llvm-$n/bin"; then
+          say "installed LLVM $n from the distribution"
+          return 0
+        fi
+      fi
+    done
+    apt-get install -y --no-install-recommends clangd clang-tidy clang-format
+  elif have dnf; then dnf install -y clang-tools-extra
+  elif have yum; then yum install -y clang-tools-extra
+  elif have zypper; then zypper --non-interactive install clang-tools
+  elif have apk; then apk add --no-cache clang-extra-tools
+  elif have pacman; then pacman -Sy --noconfirm clang
+  else say "no supported package manager (apt-get, dnf, yum, zypper, apk, pacman)"; return 1
+  fi
+}
+
+if have apt-get; then apt-get update || say "apt-get update failed, going on with the package lists there are"; fi
+# rolling (Arch) or musl (Alpine: no PyPI wheels): the distribution's are the ones to use
+if have pacman || have apk; then distro; exit $?; fi
+apt_llvm && exit 0
+have apt-get && say "apt.llvm.org didn't work here, trying PyPI"
+pypi && exit 0
+say "PyPI didn't work here, installing the distribution's packages"
+distro]]
 
 ---@class devcontainer.ToolSet
 ---@field desc string
 ---@field bins string[]  what it provides (the first one decides whether it's missing)
----@field script string  sh script run as root; $1 = lsp.llvm_version or ""
+---@field script string  sh script run as root; $1 = lsp.llvm_version or "", $2 = lsp.llvm_mirror or ""
 ---@field wanted fun(root: string): boolean  whether the workspace needs it
 
 local C_FT = { c = true, cpp = true, objc = true, objcpp = true, cuda = true }
@@ -107,7 +176,7 @@ function M.install(session, name, done)
     log.error("devcontainer: unknown tool set " .. tostring(name))
     return done and done(false)
   end
-  local version = config.get(session.local_folder).lsp.llvm_version
+  local o = config.get(session.local_folder).lsp
   local progress, unsubscribe
   async.run(function()
     log.info(("installing %s in %s (progress: :Devcontainer log)"):format(set.desc, session.name))
@@ -115,8 +184,9 @@ function M.install(session, name, done)
     progress:report("installing " .. set.desc)
     unsubscribe = log.subscribe(function(lines) progress:feed(lines) end)
     local stream = function(_, data) log.append(data) end
-    local res = async.system(session:exec_argv({ "/bin/sh", "-c", set.script, "sh", version and tostring(version) or "" },
-      { user = "root" }), { text = true, stdout = stream, stderr = stream })
+    local res = async.system(session:exec_argv({ "/bin/sh", "-c", set.script, "sh",
+      o.llvm_version and tostring(o.llvm_version) or "", o.llvm_mirror or "" }, { user = "root" }),
+      { text = true, stdout = stream, stderr = stream })
     for _, b in ipairs(set.bins) do session._which[b] = nil end
     session:prefetch(set.bins)
     local missing = vim.tbl_filter(function(b) return not session:which(b) end, set.bins)
@@ -125,7 +195,10 @@ function M.install(session, name, done)
         #missing > 0 and (": " .. table.concat(missing, ", ") .. " still missing") or ""), 0)
     end
     for _, b in ipairs(set.bins) do session.warned[b] = nil end
-    log.info(("%s: installed %s"):format(session.name, table.concat(vim.tbl_map(function(b) return session:which(b) end, set.bins), ", ")))
+    local v = async.system(session:exec_argv({ session:which(set.bins[1]), "--version" }), { text = true })
+    local version = vim.trim(((v.stdout or ""):match("[^\n]*")) or "")
+    log.info(("%s: installed %s%s"):format(session.name, table.concat(vim.tbl_map(function(b) return session:which(b) end, set.bins), ", "),
+      version ~= "" and (" (" .. version .. ")") or ""))
     require("devcontainer.lsp").restart(session.local_folder)
   end, function(err)
     if unsubscribe then unsubscribe() end
