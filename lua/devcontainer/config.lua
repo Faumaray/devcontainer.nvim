@@ -94,6 +94,11 @@ M.defaults = {
     -- init_options.compilationDatabasePath) follows the project's active build dir (build/Debug,
     -- the dir of the selected profile / preset); false keeps what the config says
     follow_build_dir = true,
+    -- clangd missing in the container of a C/C++ workspace: offer to install clangd, clang-tidy and
+    -- clang-format ("ask"), install them right away (true) or not (false); :Devcontainer install
+    install_tools = "ask",
+    -- LLVM major version to install from apt.llvm.org (nil = the latest stable release)
+    llvm_version = nil,
   },
   -- :Devcontainer configure/build/run/test/clean/debug — run in the container when attached, else on the host
   project = {

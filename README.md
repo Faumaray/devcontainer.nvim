@@ -36,6 +36,8 @@ Full documentation: `:help devcontainer`.
     open.
   - URIs are translated in both directions: diagnostics, definitions, workspace edits, file
     watchers, and markdown links in hover docs.
+  - No clangd in the container of a C/C++ project? You're offered the latest clangd, clang-tidy
+    and clang-format (apt.llvm.org, or the distribution's packages).
 - **Files that exist only in the container** (`/usr/include/c++/13/vector`, SDKs, toolchains) open
   as `devcontainer://<id>/...` buffers. "Go to definition" into the standard library works like in
   VS Code. `:Devcontainer files` finds them with your picker.
@@ -162,6 +164,9 @@ require("devcontainer").setup({
     fallback = "local",    -- server missing in the container: "local" (run on host, warn) | "none"
     follow_build_dir = true, -- --compile-commands-dir / compilationDatabasePath follow the active
                            -- build dir (build/Debug, a profile's dir, ...); false keeps them as written
+    install_tools = "ask", -- no clangd in the container of a C/C++ workspace: offer to install clangd,
+                           -- clang-tidy and clang-format ("ask"), just install them (true) or not (false)
+    llvm_version = nil,    -- LLVM major version for that (nil = the latest stable release)
   },
   project = {
     runner = "auto",       -- "auto" (overseer.nvim when installed) | "overseer" | "builtin"
@@ -225,6 +230,28 @@ container when the buffer's project is attached, and on the host otherwise:
 cmd = require("devcontainer").lsp_cmd({ "clangd", "--background-index" })
 ```
 
+### Installing clangd, clang-tidy and clang-format
+
+When a C/C++ workspace (CMakeLists.txt, compile_commands.json, meson.build, .clangd, or an open
+C/C++ file) is attached to a container without clangd, you're asked whether to install clangd,
+clang-tidy and clang-format; `:Devcontainer install` does it any time. They are installed as root:
+
+- Debian / Ubuntu: the latest stable LLVM from [apt.llvm.org](https://apt.llvm.org) (`llvm.sh`,
+  or `lsp.llvm_version`), linked as `clangd`, `clang-tidy` and `clang-format` in `/usr/local/bin`;
+  the distribution's packages when apt.llvm.org doesn't support the release
+- Fedora / RHEL (`dnf`, `yum`), openSUSE (`zypper`), Alpine (`apk`), Arch (`pacman`): the
+  distribution's packages
+
+Then clangd restarts in the container, and conform.nvim / nvim-lint use the new clang-format and
+clang-tidy. This changes the running container only: after a rebuild you're asked again ("Never"
+is remembered per project). To keep them, add them to the image, e.g. in the Dockerfile:
+
+```dockerfile
+RUN apt-get update && apt-get install -y lsb-release wget software-properties-common gnupg \
+ && wget -qO- https://apt.llvm.org/llvm.sh | bash -s -- 20 \
+ && apt-get install -y clang-tidy-20 clang-format-20
+```
+
 Absolute host paths such as mason's `~/.local/share/nvim/mason/bin/clangd` are looked up by their
 basename inside the container. Arguments that contain your workspace path (for example
 `--query-driver=/home/me/proj/tools/*`) are rewritten to the container path, and
@@ -252,6 +279,7 @@ basename inside the container. Arguments that contain your workspace path (for e
 | `:Devcontainer log` | build / lifecycle output |
 | `:Devcontainer info` | attached containers, paths, servers, ports, profile, current project |
 | `:Devcontainer forget` | forget the "always / never start" answer for this project |
+| `:Devcontainer install [clangd]` | install clangd, clang-tidy and clang-format in the container |
 
 **Project** (CMake or Cargo, detected from the current file)
 

@@ -40,6 +40,10 @@ local subcommands = {
   log = { fn = function() require("devcontainer.log").open() end },
   info = { fn = function() dc().info() end },
   forget = { fn = function() dc().forget() end },
+  install = {
+    fn = function(args) dc().install_tools(args ~= "" and vim.trim(args) or nil) end,
+    complete = function() return vim.tbl_keys(require("devcontainer.tools").sets) end,
+  },
   profile = {
     fn = function(args) dc().profile(args ~= "" and vim.trim(args) or nil) end,
     complete = function()

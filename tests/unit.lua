@@ -1063,6 +1063,119 @@ test("git: known_hosts lines missing in the container are appended", function()
   eq(vim.fn.readfile(home .. "/.ssh/known_hosts"), { "mine ssh-ed25519 CCC", "a.example ssh-ed25519 AAA", "b.example ssh-ed25519 DDD" })
 end)
 
+test("tools.offer: asks once for C/C++ workspaces without clangd, remembers never", function()
+  local tools = require("devcontainer.tools")
+  local store = require("devcontainer.store")
+  local root = tmp .. "/tools-ws"
+  vim.fn.mkdir(root, "p")
+  config.set({})
+  local has = {}
+  local function session(key)
+    return { key = key, name = key, local_folder = root, which = function(_, b) return has[b] end }
+  end
+  local asked, installed = {}, {}
+  local orig_select, orig_install = vim.ui.select, tools.install
+  local answer = "skip"
+  vim.ui.select = function(items, o, cb)
+    table.insert(asked, o.kind)
+    for _, it in ipairs(items) do
+      if it.action == answer then return cb(it) end
+    end
+  end
+  tools.install = function(s, name) table.insert(installed, s.key .. ":" .. name) end
+
+  tools.offer(session("s1"), { force = true })
+  eq(#asked, 0, "not a C/C++ workspace")
+  writef(root .. "/CMakeLists.txt", "")
+  has.clangd = "/usr/bin/clangd"
+  tools.offer(session("s1"), { force = true })
+  eq(#asked, 0, "clangd is there")
+  has.clangd = nil
+  tools.offer(session("s1"), { force = true })
+  eq(asked, { "devcontainer.install_tools" })
+  tools.offer(session("s1"), { force = true })
+  eq(#asked, 1, "once per container")
+  tools.offer(session("s2"))
+  eq(#asked, 1, "no UI: not asked")
+
+  answer = "install"
+  tools.offer(session("s3"), { force = true })
+  eq(installed, { "s3:clangd" })
+  answer = "never"
+  tools.offer(session("s4"), { force = true })
+  eq(store.get(root).install_tools, { clangd = "never" })
+  tools.offer(session("s5"), { force = true })
+  eq(#asked, 3, "never asked again for this project")
+  store.clear(root, "install_tools")
+
+  config.set({ lsp = { install_tools = false } })
+  tools.offer(session("s6"), { force = true })
+  eq(#asked, 3, "install_tools = false")
+  config.set({ lsp = { install_tools = true } })
+  tools.offer(session("s7"))
+  eq(installed, { "s3:clangd", "s7:clangd" }, "install_tools = true: without asking")
+  config.set({})
+  vim.ui.select, tools.install = orig_select, orig_install
+end)
+
+test("tools: the LLVM install script (llvm.sh, distribution fallback, dnf)", function()
+  local tools = require("devcontainer.tools")
+  local dir = tmp .. "/llvm-inst"
+  local sys, stubs, root, bin, log = dir .. "/sys", dir .. "/stubs", dir .. "/root", dir .. "/bin", dir .. "/calls"
+  vim.fn.mkdir(sys, "p")
+  for _, t in ipairs({ "sh", "sed", "head", "mktemp", "rm", "mkdir", "ln", "touch", "chmod", "cat" }) do
+    vim.uv.fs_symlink(vim.fn.exepath(t), sys .. "/" .. t)
+  end
+  local function stub(name, body)
+    writef(stubs .. "/" .. name, "#!/bin/sh\necho \"" .. name .. " $*\" >> \"$LOG\"\n" .. (body or "") .. "\n")
+    vim.uv.fs_chmod(stubs .. "/" .. name, 493)
+  end
+  local function run(env, version)
+    vim.fn.delete(log)
+    vim.fn.delete(root, "rf")
+    vim.fn.delete(bin, "rf")
+    local res = vim.system({ sys .. "/sh", "-c", tools.LLVM_SCRIPT, "sh", version or "" }, {
+      env = vim.tbl_extend("force", { PATH = stubs .. ":" .. sys, LOG = log, DEVCONTAINER_ROOT = root, DEVCONTAINER_BIN_DIR = bin }, env or {}),
+      clear_env = true,
+    }):wait()
+    return res.code, vim.fn.filereadable(log) == 1 and vim.fn.readfile(log) or {}
+  end
+  -- apt: llvm.sh with its CURRENT_LLVM_STABLE, then clang-tidy / clang-format, linked by plain name
+  stub("apt-get", [[
+for a; do case "$a" in clang-tidy-*|clang-format-*) v=${a##*-}; t=${a%-*}
+  mkdir -p "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin" && touch "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin/$t" && chmod +x "$DEVCONTAINER_ROOT/usr/lib/llvm-$v/bin/$t";; esac; done]])
+  stub("wget", [[[ -n "$FAIL_WGET" ] && exit 1; printf 'CURRENT_LLVM_STABLE=21\nCURRENT_LLVM_TRUNK=22\n' > "$2"]])
+  stub("bash", [[[ -n "$FAIL_LLVM" ] && exit 1; mkdir -p "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin"
+touch "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin/clangd"; chmod +x "$DEVCONTAINER_ROOT/usr/lib/llvm-$2/bin/clangd"]])
+  local code, calls = run()
+  eq(code, 0)
+  eq(calls[1], "apt-get update")
+  assert(calls[2]:find("lsb-release", 1, true) and calls[2]:find("software-properties-common", 1, true), calls[2])
+  assert(calls[3]:match("^wget %-qO .*/llvm%.sh https://apt%.llvm%.org/llvm%.sh$"), calls[3])
+  assert(calls[4]:match("^bash .*/llvm%.sh 21$"), calls[4])
+  eq(calls[5], "apt-get install -y --no-install-recommends clang-tidy-21 clang-format-21")
+  for _, t in ipairs({ "clangd", "clang-tidy", "clang-format" }) do
+    eq(vim.uv.fs_readlink(bin .. "/" .. t), root .. "/usr/lib/llvm-21/bin/" .. t)
+  end
+  code, calls = run(nil, "19")
+  assert(calls[4]:match("^bash .*/llvm%.sh 19$"), "lsp.llvm_version: " .. calls[4])
+  -- llvm.sh fails (unsupported release): the distribution's packages
+  code, calls = run({ FAIL_LLVM = "1" })
+  eq(code, 0)
+  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd clang-tidy clang-format")
+  code, calls = run({ FAIL_WGET = "1" })
+  eq(calls[#calls], "apt-get install -y --no-install-recommends clangd clang-tidy clang-format", "no network to apt.llvm.org")
+  -- no apt: dnf
+  vim.fn.delete(stubs, "rf")
+  stub("dnf")
+  code, calls = run()
+  eq({ code, calls }, { 0, { "dnf install -y clang-tools-extra" } })
+  vim.fn.delete(stubs, "rf")
+  vim.fn.mkdir(stubs, "p")
+  code = run()
+  eq(code, 1, "no package manager")
+end)
+
 test("runner.ssh_hint: git over SSH failures point at checkhealth", function()
   local runner = require("devcontainer.runner")
   eq(runner.ssh_hint({ "Cloning into 'dep'...", "git@git.example: Permission denied (publickey)." }), true)

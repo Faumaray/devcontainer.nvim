@@ -97,6 +97,9 @@ vim.fn.mkdir(agent_dir, "p", 448)
 vim.fn.mkdir("/tmp/devcontainer-nvim-ssh", "p")
 vim.env.FAKE_DOCKER_BIND = HOST .. ":" .. REMOTE .. ";" .. agent_dir .. ":/tmp/devcontainer-nvim-ssh"
 write(E .. "/host_known_hosts", "git.example ssh-ed25519 AAAAC3NzaE2E\n")
+-- where the fake clang tool installation puts clang-tidy / clang-format (on the container's PATH)
+vim.fn.mkdir(E .. "/tools-bin", "p")
+vim.env.PATH = E .. "/tools-bin:" .. vim.env.PATH
 
 -- a clangd that takes a moment to exit, like one busy indexing: the old client of a move is still
 -- running (and attached) for a while after stop()
@@ -432,6 +435,25 @@ check("info/statusline/checkhealth run", pcall(function()
   vim.cmd("checkhealth devcontainer")
   vim.cmd("close")
 end))
+
+-- 7g. clangd missing in the container: offered, installed as root, clangd restarts inside -------
+local tools = require("devcontainer.tools")
+local orig_script = tools.sets.clangd.script
+-- stands in for llvm.sh / the package manager: clang-tidy and clang-format appear on the PATH
+tools.sets.clangd.script = ('touch "%s/tools-installed"; for t in clang-tidy clang-format; do printf "#!/bin/sh\\n" > "%s/tools-bin/$t"; chmod +x "%s/tools-bin/$t"; done')
+  :format(E, E, E)
+session._which.clangd = false -- "not installed"
+local before = vim.lsp.get_clients({ bufnr = main_buf })[1]
+answers["devcontainer.install_tools"] = function(items) return items[1] end
+tools.offer(session, { force = true })
+check("install: offered, installed as root", wait(10000, function() return vim.uv.fs_stat(E .. "/tools-installed") ~= nil end)
+  and answers["devcontainer.install_tools"] == nil and (read(E .. "/docker.log") or ""):find('"exec", "-u", "root"', 1, true) ~= nil)
+check("install: clangd restarted in the container", wait(15000, function()
+  local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
+  return c and before and c.id ~= before.id and c.config._devcontainer_key == session.key and c.initialized
+end))
+check("install: the new tools are found", session:which("clang-format") == E .. "/tools-bin/clang-format", session._which)
+tools.sets.clangd.script = orig_script
 
 -- 7c. saving devcontainer.json offers a rebuild --------------------------------------------------
 vim.cmd.edit(HOST .. "/.devcontainer/devcontainer.json")

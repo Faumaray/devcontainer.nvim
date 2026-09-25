@@ -153,6 +153,12 @@ lsp                                                *devcontainer-option-lsp*
                           `--compile-commands-dir` / `compilationDatabasePath`
                           follow the active build dir, see
                           |devcontainer-compile-commands|
+    install_tools = "ask" clangd missing in the container of a C/C++
+                          workspace: offer to install clangd, clang-tidy and
+                          clang-format ("ask"), install them (true) or not
+                          (false), see |devcontainer-install-tools|
+    llvm_version = nil    LLVM major version to install (nil = the latest
+                          stable release)
 
 project                                        *devcontainer-option-project*
     runner = "auto"       "auto" (overseer.nvim when installed),
@@ -223,6 +229,9 @@ Container ~
 :Devcontainer info                Attached containers, servers, ports,
                                   profile and the current project.
 :Devcontainer forget              Forget the "always / never start" answer.
+:Devcontainer install [clangd]    Install clangd, clang-tidy and clang-format
+                                  in the container
+                                  (|devcontainer-install-tools|).
 
 Project (CMake or Cargo, detected from the current file) ~
 :Devcontainer configure [args]    `cmake --preset` / `cmake -S . -B ...`,
@@ -332,6 +341,19 @@ after the first configure of a build dir. Relative dirs and dirs inside the
 project are followed; others are kept. `lsp.follow_build_dir = false` keeps
 what the config says. Without the argument clangd finds the
 compile_commands.json that is symlinked into the project root.
+
+                                                  *devcontainer-install-tools*
+When a C/C++ workspace (CMakeLists.txt, compile_commands.json, meson.build,
+.clangd, or an open C/C++ file) is attached to a container without clangd,
+you're asked whether to install clangd, clang-tidy and clang-format
+(`lsp.install_tools`); `:Devcontainer install` does it any time. As root:
+Debian/Ubuntu get the latest stable LLVM from apt.llvm.org (llvm.sh, or
+`lsp.llvm_version`), linked by their plain names in /usr/local/bin, or the
+distribution's packages when apt.llvm.org doesn't support the release;
+dnf/yum, zypper, apk and pacman systems get the distribution's packages.
+clangd then restarts in the container. Only the running container changes:
+after a rebuild you're asked again ("Never" is remembered per project); add
+the tools to the image to keep them.
 
 ==============================================================================
 7. CONTAINER-ONLY FILES                              *devcontainer-remote-fs*

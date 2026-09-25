@@ -222,6 +222,7 @@ function M.rewrite(cfg)
   new._devcontainer_cdb = cdb or override_cdb
   if not argv then
     local fallback = opts(session.local_folder).fallback
+    vim.schedule(function() require("devcontainer.tools").offer(session) end)
     if not session.warned[name] then
       session.warned[name] = true
       log.warn(("%s not found in container %s — %s"):format(
