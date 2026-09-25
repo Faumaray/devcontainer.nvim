@@ -97,11 +97,46 @@ function M.check()
     end
     local fwd = vim.tbl_map(ports.describe, ports.list(s))
     if #fwd > 0 then h.info("ports: " .. table.concat(fwd, ", ")) end
-    if s.ssh_agent then
-      h.ok("SSH agent available in the container (SSH_AUTH_SOCK)")
-    elseif s.ssh_agent == false then
+    if s.ssh_agent == false then
       h.info("SSH agent not mounted in this container: rebuild it to get one (git.ssh_agent)")
+    elseif s.ssh_agent then
+      M.check_ssh(s)
     end
+  end
+end
+
+--- The SSH agent and known_hosts as build tasks in the container see them.
+function M.check_ssh(s)
+  local h = vim.health
+  local git = require("devcontainer.git")
+  local relay = vim.fn.has("mac") == 0 and git.relay_status() or { state = "mac" }
+  if relay.state == "mac" then
+    h.ok("SSH agent: Docker Desktop's /run/host-services/ssh-auth.sock")
+  elseif relay.state == "self" then
+    h.ok(("SSH agent relay: this Neovim -> %s"):format(relay.upstream or vim.env.SSH_AUTH_SOCK or "?"))
+  elseif relay.state == "other" then
+    h.ok(("SSH agent relay: Neovim pid %s -> %s"):format(relay.pid or "?", relay.upstream or "?"))
+  else
+    h.warn("no Neovim serves the SSH agent socket", {
+      "start Neovim where $SSH_AUTH_SOCK points at your agent (see :Devcontainer log)",
+    })
+  end
+  local d = git.diagnose(s)
+  if not d then return h.warn("could not run the SSH check in the container") end
+  if d.sock == "" then
+    h.warn("tasks in the container get no SSH_AUTH_SOCK", { "rebuild the container (git.ssh_agent)" })
+  elseif d.ssh_add == "missing" then
+    h.info("ssh-add is not installed in the container: the agent can't be checked")
+  elseif d.ssh_add == "0" then
+    h.ok(("tasks in the container reach the SSH agent (%d key%s)"):format(d.keys, d.keys == 1 and "" or "s"))
+  elseif d.ssh_add == "1" then
+    h.warn("the SSH agent has no keys", { "ssh-add your key on the host, in the agent the relay points at" })
+  elseif relay.state ~= "none" then -- (no relay: warned above)
+    h.error(("tasks in the container can't reach the SSH agent at %s: %s"):format(d.sock, d.error or "?"))
+  end
+  if not d.known_hosts then
+    h.info(("no ~/.ssh/known_hosts for %s: ssh in builds can't accept unknown hosts (git.known_hosts)"):format(
+      s.remote_user or "the container user"))
   end
 end
 

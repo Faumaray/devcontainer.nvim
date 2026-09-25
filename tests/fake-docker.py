@@ -80,6 +80,9 @@ elif cmd == "inspect":
         print("")
 elif cmd == "exec":
     env = dict(os.environ)
+    # like docker: the host's agent socket isn't passed into the container
+    env.pop("SSH_AUTH_SOCK", None)
+    env.pop("SSH_AGENT_PID", None)
     cwd = None
     i = 0
     while i < len(rest):

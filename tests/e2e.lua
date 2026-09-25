@@ -85,6 +85,19 @@ vim.fn.mkdir(E .. "/dotrepo", "p")
 write(E .. "/dotrepo/.e2erc", "x\n")
 vim.system({ "sh", "-c", 'cd "$1" && git init -q && git add -A && git -c user.email=a@b -c user.name=t commit -qm x', "sh", E .. "/dotrepo" }):wait()
 
+-- a real ssh-agent with a key; its relay dir is bind-mounted like git.agent_mount() does
+local agent_sock = E .. "/agent.sock"
+local agent_pid = tonumber((vim.system({ "ssh-agent", "-s", "-a", agent_sock }, { text = true }):wait().stdout or "")
+  :match("SSH_AGENT_PID=(%d+)"))
+vim.system({ "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "e2e-key", "-f", E .. "/id_e2e" }):wait()
+vim.system({ "ssh-add", "-q", E .. "/id_e2e" }, { env = { SSH_AUTH_SOCK = agent_sock } }):wait()
+vim.env.SSH_AUTH_SOCK = agent_sock
+local agent_dir = require("devcontainer.git").host_agent_dir()
+vim.fn.mkdir(agent_dir, "p", 448)
+vim.fn.mkdir("/tmp/devcontainer-nvim-ssh", "p")
+vim.env.FAKE_DOCKER_BIND = HOST .. ":" .. REMOTE .. ";" .. agent_dir .. ":/tmp/devcontainer-nvim-ssh"
+write(E .. "/host_known_hosts", "git.example ssh-ed25519 AAAAC3NzaE2E\n")
+
 -- a clangd that takes a moment to exit, like one busy indexing: the old client of a move is still
 -- running (and attached) for a while after stop()
 local real_clangd = vim.fn.exepath("clangd")
@@ -94,7 +107,8 @@ vim.uv.fs_chmod(E .. "/slow-exit/clangd", 493)
 vim.env.PATH = E .. "/slow-exit:" .. vim.env.PATH
 
 require("devcontainer").setup({ backend = "docker", docker = E .. "/bin/docker",
-  git = { gitconfig = E .. "/host.gitconfig" }, dotfiles = { repository = E .. "/dotrepo" } })
+  git = { gitconfig = E .. "/host.gitconfig", known_hosts = E .. "/host_known_hosts" },
+  dotfiles = { repository = E .. "/dotrepo" } })
 vim.lsp.config("clangd", {
   cmd = { "clangd", "--log=error" },
   filetypes = { "c", "cpp" },
@@ -149,6 +163,11 @@ check("remoteEnv substituted", session.env.MY_VAR == REMOTE .. "/x", session.env
 check("remoteEnv from metadata uses ${containerEnv}", session.env.FROM_META == vim.env.HOME .. "/meta", session.env.FROM_META)
 check("postCreateCommand ran", vim.uv.fs_stat(E .. "/post-create-ran") ~= nil)
 check("~/.gitconfig copied into the container", read(E .. "/home/.gitconfig") == "[user]\n\tname = e2e\n", read(E .. "/home/.gitconfig"))
+check("known_hosts: the host's entries added for the container user",
+  read(E .. "/home/.ssh/known_hosts") == "git.example ssh-ed25519 AAAAC3NzaE2E\n", read(E .. "/home/.ssh/known_hosts"))
+local ssh = require("devcontainer.git").diagnose(session)
+check("ssh: tasks in the container reach the host's agent through the relay",
+  ssh and ssh.sock == "/tmp/devcontainer-nvim-ssh/agent.sock" and ssh.ssh_add == "0" and ssh.keys == 1, ssh)
 check("dotfiles cloned and linked", vim.uv.fs_readlink(E .. "/home/.e2erc") == E .. "/home/dotfiles/.e2erc")
 check("Starting and Attached events", wait(2000, function() return #events >= 2 end) and events[1][1] == "DevcontainerStarting"
   and events[2][1] == "DevcontainerAttached" and events[2][2].local_folder == HOST and events[2][2].key == session.key, events)
@@ -474,6 +493,10 @@ if session then
     and session.remote_user == "vscode" and session.remote_folder == REMOTE, session)
   check("cli: merged configuration used", session.name == "e2e-cli" and session.env.FROM_CLI == REMOTE, session.env.FROM_CLI)
   check("cli: postAttachCommand ran", wait(5000, function() return vim.uv.fs_stat(E .. "/post-attach-ran") ~= nil end))
+  check("cli: lifecycle commands get the agent (--remote-env)", (read(E .. "/docker.log") or "")
+    :find('"--remote-env", "SSH_AUTH_SOCK=/tmp/devcontainer-nvim-ssh/agent.sock"', 1, true) ~= nil)
+  local cssh = require("devcontainer.git").diagnose(session)
+  check("cli: tasks in the container reach the agent", cssh and cssh.ssh_add == "0" and cssh.keys == 1, cssh)
   check("cli: clangd moved into the new container", wait(15000, function()
     local c = vim.lsp.get_clients({ bufnr = main_buf })[1]
     return c and c.config._devcontainer_key == session.key and c.initialized
@@ -496,5 +519,6 @@ check("never two clangd clients attached to a buffer at once", #overlaps == 0, o
 
 io.stdout:write(failures == 0 and "\nall e2e checks passed\n" or ("\n%d e2e checks failed\n"):format(failures))
 for _, c in ipairs(vim.lsp.get_clients()) do c:stop(true) end
+if agent_pid then vim.uv.kill(agent_pid, 15) end
 vim.wait(500)
 os.exit(failures == 0 and 0 or 1)

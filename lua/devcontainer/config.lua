@@ -39,6 +39,9 @@ M.defaults = {
     ssh_agent = true,
     -- copy ~/.gitconfig into the container when it has none: true | false | path of the file to copy
     gitconfig = true,
+    -- add the hosts of ~/.ssh/known_hosts to the container user's known_hosts (builds can't answer
+    -- ssh's "continue connecting?"): true | false | path of the file to copy
+    known_hosts = true,
   },
   dotfiles = {
     -- "owner/repo" (GitHub) or any git URL, cloned into new containers

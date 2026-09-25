@@ -33,7 +33,8 @@ function M.up(ctx, opts)
   if opts.no_cache then table.insert(args, "--build-no-cache") end
   local git = require("devcontainer.git")
   local agent = git.agent_mount(o)
-  if agent then vim.list_extend(args, { "--mount", agent }) end
+  -- --remote-env: the lifecycle commands the CLI runs itself (postCreateCommand, ...) get the agent too
+  if agent then vim.list_extend(args, { "--mount", agent, "--remote-env", "SSH_AUTH_SOCK=" .. git.AGENT_SOCK }) end
   vim.list_extend(args, git.cli_dotfiles_args(o))
   vim.list_extend(args, o.cli_up_args or {})
 

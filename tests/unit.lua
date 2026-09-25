@@ -982,5 +982,93 @@ test("lsp.refresh_compile_commands restarts only servers whose database moved or
   eq(restarted, { 2, 3 })
 end)
 
+test("git: the agent relay is shared between Neovims and taken over when its server is gone", function()
+  local git = require("devcontainer.git")
+  local uv = vim.uv
+  local upstream = tmp .. "/agent-upstream2.sock"
+  local agent = uv.new_pipe(false)
+  assert(agent:bind(upstream))
+  agent:listen(4, function()
+    local c = uv.new_pipe(false)
+    agent:accept(c)
+    c:read_start(function(_, d) if d then c:write("agent:" .. d) else c:close() end end)
+  end)
+  local orig = vim.env.SSH_AUTH_SOCK
+  vim.env.SSH_AUTH_SOCK = upstream
+  local path = git.host_agent_dir() .. "/agent.sock"
+  local function ask(msg)
+    local got
+    local c = uv.new_pipe(false)
+    c:connect(path, function(err)
+      if err then got = "error" return end
+      c:read_start(function(_, d) if d then got = (got or "") .. d end end)
+      c:write(msg)
+    end)
+    vim.wait(2000, function() return got ~= nil end)
+    c:close()
+    return got
+  end
+
+  eq(git.start_agent_relay(), true)
+  local st = git.relay_status()
+  eq({ st.state, st.pid, st.upstream }, { "self", uv.os_getpid(), upstream })
+  git.stop_agent_relay()
+  eq(uv.fs_stat(path), nil, "socket removed on stop, so another Neovim can take over")
+
+  -- another Neovim serves the socket: shared, not taken over
+  local other = uv.new_pipe(false)
+  assert(other:bind(path))
+  other:listen(4, function()
+    local c = uv.new_pipe(false)
+    other:accept(c)
+    c:read_start(function(_, d) if d then c:write("other:" .. d) else c:close() end end)
+  end)
+  git.takeover_interval = 100
+  eq(git.start_agent_relay(), true)
+  eq(git.relay_status().state, "other")
+  eq(ask("x"), "other:x")
+  -- ... until it's gone
+  other:close()
+  uv.fs_unlink(path)
+  vim.wait(3000, function() return git.relay_status().state == "self" end)
+  eq(git.relay_status().state, "self", "taken over")
+  eq(ask("y"), "agent:y")
+  git.stop_agent_relay()
+
+  -- a socket left behind by a Neovim that crashed is replaced
+  vim.system({ "python3", "-c", "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])", path }):wait()
+  eq(uv.fs_stat(path).type, "socket")
+  eq(git.start_agent_relay(), true)
+  eq(git.relay_status().state, "self")
+  eq(ask("z"), "agent:z")
+  git.stop_agent_relay()
+  git.takeover_interval = 10000
+  agent:close()
+  vim.env.SSH_AUTH_SOCK = orig
+end)
+
+test("git: known_hosts lines missing in the container are appended", function()
+  local git = require("devcontainer.git")
+  local home = tmp .. "/kh-home"
+  vim.fn.mkdir(home, "p")
+  local function run(input)
+    return vim.system({ "sh", "-c", git.KNOWN_HOSTS_SCRIPT }, { env = { HOME = home }, stdin = input }):wait()
+  end
+  eq(run("a.example ssh-ed25519 AAA\n# comment\n\n|1|salt|hash ssh-rsa BBB\n").code, 0)
+  eq(vim.fn.readfile(home .. "/.ssh/known_hosts"), { "a.example ssh-ed25519 AAA", "|1|salt|hash ssh-rsa BBB" })
+  eq(vim.uv.fs_stat(home .. "/.ssh").mode % 512, 448, "~/.ssh is 0700")
+  eq(vim.uv.fs_stat(home .. "/.ssh/known_hosts").mode % 512, 384, "known_hosts is 0600")
+  vim.fn.writefile({ "mine ssh-ed25519 CCC", "a.example ssh-ed25519 AAA" }, home .. "/.ssh/known_hosts")
+  eq(run("a.example ssh-ed25519 AAA\nb.example ssh-ed25519 DDD").code, 0)
+  eq(vim.fn.readfile(home .. "/.ssh/known_hosts"), { "mine ssh-ed25519 CCC", "a.example ssh-ed25519 AAA", "b.example ssh-ed25519 DDD" })
+end)
+
+test("runner.ssh_hint: git over SSH failures point at checkhealth", function()
+  local runner = require("devcontainer.runner")
+  eq(runner.ssh_hint({ "Cloning into 'dep'...", "git@git.example: Permission denied (publickey)." }), true)
+  eq(runner.ssh_hint({ "Host key verification failed.", "fatal: Could not read from remote repository." }), true)
+  eq(runner.ssh_hint({ "main.cpp:3:1: error: expected ';'" }), false)
+end)
+
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))
 os.exit(failures == 0 and 0 or 1)

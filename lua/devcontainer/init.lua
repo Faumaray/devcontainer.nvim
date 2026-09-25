@@ -202,6 +202,9 @@ function M.up(opts)
       M._teardown(existing)
     end
 
+    -- serve the agent before the container starts: the CLI runs lifecycle commands during `up`
+    if o.git and o.git.ssh_agent and vim.fn.has("mac") == 0 then require("devcontainer.git").start_agent_relay() end
+
     local backend_name, backend = pick_backend(o)
     local name = conf.name or vim.fs.basename(root)
     log.info(("%s %s (%s backend, progress: :Devcontainer log)"):format(

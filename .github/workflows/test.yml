@@ -43,7 +43,7 @@ jobs:
           neovim: true
           version: ${{ matrix.nvim }}
       - name: Install clangd and ninja
-        run: sudo apt-get update -q && sudo apt-get install -y -q clangd ninja-build
+        run: sudo apt-get update -q && sudo apt-get install -y -q clangd ninja-build openssh-client
       - name: Fetch the integrated plugins
         run: |
           mkdir -p "$RUNNER_TEMP/plugins"
