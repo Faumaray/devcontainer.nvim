@@ -2,6 +2,7 @@
 local async = require("devcontainer.async")
 local runner = require("devcontainer.runner")
 
+local shell = require("devcontainer.shell")
 local M = { name = "cargo" }
 
 local function read(path)
@@ -140,7 +141,7 @@ M.actions = {
     desc = "cargo build",
     run = function(ctx, args)
       local a = vim.list_extend(profile_args(ctx), target_args(ctx, args.target))
-      vim.list_extend(a, ctx.opts.build_args or {})
+      vim.list_extend(a, shell.args(ctx.opts.build_args))
       vim.list_extend(a, args.extra)
       return { cargo(ctx, "build", a, ("cargo build%s (%s)"):format(args.target and (" " .. args.target) or "", profile(ctx))) }
     end,
@@ -164,7 +165,7 @@ M.actions = {
     desc = "cargo test",
     run = function(ctx, args)
       local a = profile_args(ctx)
-      vim.list_extend(a, ctx.opts.test_args or {})
+      vim.list_extend(a, shell.args(ctx.opts.test_args))
       vim.list_extend(a, args.extra)
       return { cargo(ctx, "test", a) }
     end,

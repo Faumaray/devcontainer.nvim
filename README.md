@@ -187,6 +187,8 @@ require("devcontainer").setup({
       configure_args = {},
       build_args = {},
       ctest_args = { "--output-on-failure" },
+      ctest_parallel = true, -- ctest --parallel: true = one job per CPU, false = sequential, or a number
+      ctest_shuffle = true,  -- ctest --schedule-random: tests start in random order
       link_compile_commands = true, -- symlink <build>/compile_commands.json into the project root
       run_cwd = "exe",     -- cwd for run/debug: "exe" (executable's dir) | "build" | "root"
     },
@@ -411,6 +413,18 @@ so servers that only listen on the container's `localhost` work, and so do compo
   before the quickfix list is built, so `:cnext` opens your files.
 - Errors in files that exist only in the container (system headers, `~/.cargo/registry`) point at
   `devcontainer://` buffers.
+
+### Arguments and ctest
+
+Entries of `configure_args`, `build_args`, `ctest_args`, `run_args` (and cargo's) are unquoted like a
+shell would, since the command runs without one: `'-DCMAKE_CXX_FLAGS="-Wall -Wextra"'` reaches
+cmake as `-DCMAKE_CXX_FLAGS=-Wall -Wextra`. Write `\"` for a literal quote; entries without quotes
+or backslashes are passed as they are. Arguments typed after `:Devcontainer build ... --` are split
+the same way. A build dir configured with the old, literal quotes needs `:Devcontainer configure` again.
+
+ctest runs tests in parallel and in random order by default (tests sharing a resource declare
+`RESOURCE_LOCK` / `RUN_SERIAL`); `ctest_parallel = false` / `ctest_shuffle = false` (also per profile)
+restore ctest's own behaviour, and `-j` / `--schedule-random` in `ctest_args` win.
 
 ## Integrations
 

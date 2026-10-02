@@ -217,7 +217,7 @@ M.core_actions = CORE
 
 --- Split ":Devcontainer build app -- --flag" into { target = "app", extra = { "--flag" } }.
 function M.parse_args(action, str)
-  local words = vim.split(vim.trim(str or ""), "%s+", { trimempty = true })
+  local words = require("devcontainer.shell").split(str or "")
   local args = { extra = {} }
   local takes_target = action == "build" or action == "run" or action == "debug"
   local after_dashes = false
@@ -245,7 +245,7 @@ function M.action(name, argstr)
   if not ctx then return log.warn("no CMake or Cargo project around " .. start_path()) end
   local args = M.parse_args(name, argstr)
   if (name == "run" or name == "debug") and #args.extra == 0 then
-    args.extra = vim.deepcopy(ctx.options.project.run_args or {})
+    args.extra = require("devcontainer.shell").args(ctx.options.project.run_args)
   end
   async.run(function()
     local steps
