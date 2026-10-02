@@ -131,6 +131,11 @@ M.defaults = {
       configure_args = {},
       build_args = {},
       ctest_args = { "--output-on-failure" },
+      -- ctest --parallel: true = one job per CPU, false = sequential, or a number. Tests that share
+      -- a resource declare RESOURCE_LOCK / RUN_SERIAL
+      ctest_parallel = true,
+      -- ctest --schedule-random: start the tests in random order
+      ctest_shuffle = true,
       -- symlink <build>/compile_commands.json into the project root for clangd
       link_compile_commands = true,
       -- working directory of :Devcontainer run/debug: "exe" (executable's dir) | "build" | "root"

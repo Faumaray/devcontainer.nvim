@@ -5,6 +5,7 @@ local jsonc = require("devcontainer.jsonc")
 local runner = require("devcontainer.runner")
 local store = require("devcontainer.store")
 
+local shell = require("devcontainer.shell")
 local M = { name = "cmake" }
 
 -- detection ----------------------------------------------------------------------------------
@@ -272,6 +273,27 @@ function M.efm()
   }, ",")
 end
 
+local function has_flag(cmd, ...)
+  for _, a in ipairs(cmd) do
+    for _, f in ipairs({ ... }) do
+      if a == f or vim.startswith(a, f .. "=") or (#f == 2 and a:sub(1, 2) == f) then return true end
+    end
+  end
+  return false
+end
+
+--- ctest runs tests in parallel and in random order unless told otherwise (ctest_parallel,
+--- ctest_shuffle, or the flags themselves in ctest_args / the command).
+function M.ctest_defaults(cmd, o)
+  local jobs = o.ctest_parallel
+  if jobs == nil or jobs == true then jobs = vim.uv.available_parallelism() end
+  if type(jobs) == "number" and jobs > 1 and not has_flag(cmd, "-j", "--parallel") then
+    vim.list_extend(cmd, { "--parallel", tostring(jobs) })
+  end
+  if o.ctest_shuffle ~= false and not has_flag(cmd, "--schedule-random") then table.insert(cmd, "--schedule-random") end
+  return cmd
+end
+
 local function spec(ctx, r, t)
   t.efm = t.efm or M.efm()
   t.after = t.after and { provider = M.name, root = ctx.root, action = t.after } or nil
@@ -293,7 +315,7 @@ local function configure_step(ctx, r, extra, fresh)
   end
   table.insert(cmd, "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
   if fresh then table.insert(cmd, "--fresh") end
-  vim.list_extend(cmd, ctx.opts.configure_args or {})
+  vim.list_extend(cmd, shell.args(ctx.opts.configure_args))
   vim.list_extend(cmd, extra or {})
   local steps = {}
   if r.host_build then
@@ -312,7 +334,7 @@ local function build_cmd(ctx, r, target, extra)
   if not r.build_preset and r.build_type then vim.list_extend(cmd, { "--config", r.build_type }) end
   if target then vim.list_extend(cmd, { "--target", target }) end
   table.insert(cmd, "--parallel")
-  vim.list_extend(cmd, ctx.opts.build_args or {})
+  vim.list_extend(cmd, shell.args(ctx.opts.build_args))
   vim.list_extend(cmd, extra or {})
   return cmd
 end
@@ -379,8 +401,9 @@ M.actions = {
       local r = M.resolve(ctx)
       local cmd = r.test_preset and { "ctest", "--preset", r.test_preset }
         or { "ctest", "--test-dir", r.build_arg, "-C", r.build_type or "Debug" }
-      vim.list_extend(cmd, ctx.opts.ctest_args or {})
+      vim.list_extend(cmd, shell.args(ctx.opts.ctest_args))
       vim.list_extend(cmd, args.extra)
+      M.ctest_defaults(cmd, ctx.opts)
       local steps = args.template and {} or build_steps(ctx, r)
       table.insert(steps, spec(ctx, r, { name = "ctest (" .. label(r) .. ")", cmd = cmd }))
       return steps

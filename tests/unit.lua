@@ -317,6 +317,7 @@ test("cmake without presets: build type dir, ctest, generator on first configure
   writef(root .. "/CMakeLists.txt", "")
   local opts = vim.deepcopy(require("devcontainer.config").options.project.cmake)
   opts.generator = "Ninja"
+  opts.ctest_parallel, opts.ctest_shuffle = false, false
   local ctx = setmetatable({ root = root, provider = cmake, state = { build_type = "Release" }, opts = opts }, { __index = {
     exec_path = function(_, x) return x end, task = function(_, t) t.cwd = root; return t end,
   } })
@@ -1364,6 +1365,36 @@ test("project root: shell, formatters, linters and servers start there, not in a
 
   vim.cmd.cd(orig_cwd)
   session_mod.unregister(s)
+end)
+
+test("shell: quotes in configured args, like a terminal", function()
+  local sh = require("devcontainer.shell")
+  eq(sh.split([[a "b c" 'd e' f\ g h"i j"k ""]]), { "a", "b c", "d e", "f g", "hi jk", "" })
+  eq(sh.split([[-DX="a \"q\" b"]]), { '-DX=a "q" b' })
+  eq(sh.split([[unbalanced "x y]]), { "unbalanced", '"x y' })
+  eq(sh.unquote('-DCMAKE_C_FLAGS="-Wno-error=maybe-uninitialized -Wno-error=stringop-overflow"'),
+    "-DCMAKE_C_FLAGS=-Wno-error=maybe-uninitialized -Wno-error=stringop-overflow")
+  eq(sh.unquote("-G Ninja"), "-G Ninja", "no quotes: untouched")
+  eq(sh.unquote('-DA="x" -DB=y'), '-DA="x" -DB=y', "several words: untouched")
+  eq(sh.args({ "-DX=1", "'a b'" }), { "-DX=1", "a b" })
+  eq(require("devcontainer.project").parse_args("build", 'app -- -DX="a b"'), { target = "app", extra = { "-DX=a b" } })
+
+  local root = tmp .. "/quoted"
+  writef(root .. "/CMakeLists.txt", "")
+  config.set({ project = { cmake = { configure_args = { '-DCMAKE_CXX_FLAGS="-Wa -Wb"', "-DX=1" } } } })
+  local ctx = require("devcontainer.project").detect(root)
+  local steps = ctx.provider.actions[1].run(ctx, { extra = {} })
+  local cmd = steps[#steps].cmd
+  eq(vim.list_slice(cmd, #cmd - 1), { "-DCMAKE_CXX_FLAGS=-Wa -Wb", "-DX=1" })
+
+  local cm = require("devcontainer.project.cmake")
+  local jobs = tostring(vim.uv.available_parallelism())
+  eq(cm.ctest_defaults({ "ctest" }, {}), { "ctest", "--parallel", jobs, "--schedule-random" }, "defaults")
+  eq(cm.ctest_defaults({ "ctest" }, { ctest_parallel = false, ctest_shuffle = false }), { "ctest" })
+  eq(cm.ctest_defaults({ "ctest", "-j2", "--schedule-random" }, {}), { "ctest", "-j2", "--schedule-random" }, "already given")
+  eq(cm.ctest_defaults({ "ctest", "--parallel", "3" }, { ctest_shuffle = false }), { "ctest", "--parallel", "3" })
+  eq(cm.ctest_defaults({ "ctest" }, { ctest_parallel = 4, ctest_shuffle = false }), { "ctest", "--parallel", "4" })
+  config.set({})
 end)
 
 io.stdout:write(("\n%d/%d passed\n"):format(count - failures, count))

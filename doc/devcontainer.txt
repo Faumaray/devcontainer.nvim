@@ -184,6 +184,9 @@ project                                        *devcontainer-option-project*
       generator = nil,    e.g. "Ninja", for a new build dir
       configure_args = {}, build_args = {},
       ctest_args = { "--output-on-failure" },
+      ctest_parallel = true  ctest --parallel: true (one job per CPU),
+                          false or a number
+      ctest_shuffle = true   ctest --schedule-random
       link_compile_commands = true,  symlink compile_commands.json into
                           the project root
       run_cwd = "exe",    cwd of run/debug: "exe", "build" or "root"
@@ -401,6 +404,14 @@ Cargo: workspaces, binary targets from `cargo metadata`, profiles (custom
 With overseer.nvim the actions run as overseer tasks (|devcontainer-overseer|).
 `User DevcontainerTaskDone` fires after every task sequence.
 
+
+Entries of `configure_args`, `build_args`, `ctest_args`, `run_args` (and
+cargo's) are unquoted like a shell would, as the command runs without one:
+`'-DX="a b"'` reaches cmake as `-DX=a b`; `\"` is a literal quote. Arguments
+typed after `:Devcontainer build ... --` are split the same way. A build dir
+configured with literal quotes needs `:Devcontainer configure` again.
+ctest runs in parallel and in random order by default (`ctest_parallel`,
+`ctest_shuffle`); tests sharing a resource declare RESOURCE_LOCK/RUN_SERIAL.
 ==============================================================================
 9. DEBUGGING                                               *devcontainer-dap*
 

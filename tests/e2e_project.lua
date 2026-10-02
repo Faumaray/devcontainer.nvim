@@ -229,7 +229,7 @@ end
 
 -- profiles: the selected profile picks the build dir and adds configure args
 require("devcontainer").add_profiles({
-  asan = { desc = "sanitizers", project = { cmake = { build_dir = "build/${profile}-${buildType}", configure_args = { "-DDC_PROFILE=asan" } } } },
+  asan = { desc = "sanitizers", project = { cmake = { build_dir = "build/${profile}-${buildType}", configure_args = { "-DDC_PROFILE=asan", '-DCMAKE_CXX_FLAGS="-Wall -Wextra"' } } } },
 })
 vim.cmd("Devcontainer profile asan")
 check("profile: statusline shows it", require("devcontainer").statusline() == "cm [asan]", require("devcontainer").statusline())
@@ -237,6 +237,9 @@ res = run("Devcontainer build")
 log = read(E .. "/docker.log") or ""
 check("profile: build configured the profile's build dir with its args", res.ok == true
   and log:find('"build/asan%-Debug"[^\n]*"%-DDC_PROFILE=asan"') ~= nil and res.name == "cmake build (Debug, asan)", res)
+local asan_cc = read(CM .. "/build/asan-Debug/compile_commands.json") or ""
+check("configure_args: shell quotes removed, so the flags are separate compiler options",
+  asan_cc:find(" -Wall -Wextra ", 1, true) ~= nil and asan_cc:find('"-Wall', 1, true) == nil and asan_cc:find('\\"-Wall', 1, true) == nil, asan_cc:sub(1, 400))
 check("profile: compile_commands.json follows the profile", vim.uv.fs_readlink(CM .. "/compile_commands.json") == "build/asan-Debug/compile_commands.json")
 if have_clangd then
   check("clangd: follows the profile's build dir", wait(20000, function()
@@ -273,6 +276,9 @@ vim.cmd("bwipeout!")
 
 res = run("Devcontainer test")
 check("cmake: ctest passes", res.ok == true, res)
+local ctest_log = read(E .. "/docker.log") or ""
+check("cmake: ctest runs in parallel and in random order", ctest_log:find('"ctest"[^\n]*"%-%-parallel"[^\n]*"%-%-schedule%-random"') ~= nil,
+  ctest_log:match('[^\n]*"ctest"[^\n]*'))
 
 res = run("Devcontainer debug")
 check("cmake: debug builds then starts nvim-dap", res.ok == true and #dap_runs == 1, res)
